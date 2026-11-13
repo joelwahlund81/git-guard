@@ -52,6 +52,12 @@ Hooken går igenom stegen i ordning. Ett **✗** stoppar pushen, ett **!** är b
 | 8 | Repots egen hook | Kör repots egen `pre-push` / `pre-push.local` om den finns | ✗ |
 
 Ändras bara dokumentation (`.md`, `.txt`, bilder, mappen `docs/`) hoppas steg 6–7 över.
+Ändras bara sådant som inte påverkar .NET-bygget (`.sql`, `.yml`, `.ps1`, `.sh`, `Dockerfile` m.m.)
+hoppas .NET-stegen över.
+
+**Snabbare andra gången:** när en körning är helt grön sparas resultatet i `.git/git-guard-ok`. Kör du
+`gg` och sedan `git push` utan att ändra något, hoppas .NET och testerna över vid pushen. Det gäller
+bara när exakt samma innehåll pushas, arbetskatalogen är ren och inställningarna är desamma.
 Saknas ett verktyg (sqlfluff, gitleaks, dotnet, npm, pytest, go) hoppas steget över med en varning.
 Varje steg som hoppas över säger varför, och sist kommer en **sammanfattning** med en rad per steg
 och hur lång tid det tog. Vill du se exakt vad som körs: `GITGUARD_VERBOSE=1 git push` (en gång)
@@ -70,7 +76,7 @@ eller `git config gitguard.verbose true`.
 | 6.3 | Tredjepartsbibliotek | Nedgraderingar (NU1605), versionskonflikter (NU1107), sårbara paket med hög/kritisk risk (NU1903/1904) | ✗ |
 | | | Utanför tillåtet intervall (NU1608), .NET Framework-paket (NU1701), sårbarheter med låg/medel risk | ! |
 | | | Ett beroende löses till olika versioner i olika projekt (transitiv drift) | ! |
-| 6.4 | Formatering | `dotnet format --verify-no-changes` på ändrade filer (följer `.editorconfig`) | ✗ |
+| 6.4 | Formatering | `dotnet format whitespace --folder` på ändrade filer: mellanslag, indrag och radslut enligt `.editorconfig`. Tar några sekunder. Med `gitguard.format style` kontrolleras även kodstil och analyzers, men då laddas hela solutionen | ✗ |
 | 6.5 | Build | `dotnet build`: referenskonflikter (MSB3277) och referenser som inte hittas (MSB3245) | ✗ |
 | 6.6 | Test | `dotnet test` om testprojekt finns | ✗ |
 
@@ -123,6 +129,8 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.skipTests` | `true` | Kör inga tester |
 | `gitguard.skipDotnet` | `true` | Hoppa över alla .NET-steg |
 | `gitguard.skipFormat` | `true` | Hoppa över `dotnet format` |
+| `gitguard.format` | `whitespace` (standard) / `style` / `off` | Hur noga formateringen kontrolleras (se 6.4) |
+| `gitguard.cache` | `false` | Kör alltid allt. Standard: en grön körning sparas, och samma innehåll kontrolleras inte igen |
 | `gitguard.versionDrift` | `warn` | Versionsdrift varnar i stället för att stoppa |
 | `gitguard.existingIssues` | `warn` (standard) / `error` | Problem i .NET-filer som pushen inte rör varnar med "(fanns redan)" i stället för att stoppa |
 | `gitguard.sqlLint` | `error` / `warn` / `off` | Hur SQL-lint ska räknas. Standard: `error` om repot har `.sqlfluff`, annars `warn` |

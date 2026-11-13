@@ -8,7 +8,11 @@
 #   gitguard.disable            true = stäng av alla kontroller
 #   gitguard.skipTests          true = kör inga tester
 #   gitguard.skipDotnet         true = hoppa över .NET-kontrollerna
-#   gitguard.skipFormat         true = hoppa över dotnet format
+#   gitguard.skipFormat         true = hoppa över dotnet format (samma som format=off)
+#   gitguard.format             whitespace (standard, snabb) | style (kodstil + analyzers,
+#                               laddar hela solutionen) | off
+#   gitguard.cache              false = kör alltid allt (standard: true – en grön körning
+#                               av gg eller push sparas och .NET/tester körs inte om i onödan)
 #   gitguard.versionDrift       error (standard) | warn
 #   gitguard.existingIssues     warn (standard) | error – problem i .NET-filer som pushen
 #                               inte rör (de fanns redan) varnar i stället för att stoppa
@@ -252,10 +256,41 @@ if has_file 'package.json' && [ -f package-lock.json ] && ! has_file 'package-lo
 fi
 
 # --- 6. Har kod ändrats? -----------------------------------------------------
+# code_changed:   något annat än dokumentation
+# dotnet_changed: något som kan påverka .NET-bygget (inte SQL, pipelines, skript m.m.)
 code_changed=0
+dotnet_changed=0
 for f in "${files[@]+"${files[@]}"}"; do
-  case "$f" in *.md|*.txt|docs/*|*.png|*.jpg|*.jpeg|*.gif|*.svg) ;; *) code_changed=1 ;; esac
+  case "$f" in *.md|*.txt|docs/*|*.png|*.jpg|*.jpeg|*.gif|*.svg) continue ;; esac
+  code_changed=1
+  case "$f" in
+    *.sql|*.SQL|*.yml|*.yaml|*.ps1|*.psm1|*.psd1|*.sh|*.bash|*.py|*.go|*.tf|*.bicep) ;;
+    Dockerfile|*/Dockerfile|.gitignore|*/.gitignore|.gitattributes|LICENSE*) ;;
+    *) dotnet_changed=1 ;;
+  esac
 done
+
+# --- Resultatcache -----------------------------------------------------------
+# En grön körning sparas som "<tree> <inställningar>" i .git/git-guard-ok. Pushar du sedan
+# exakt samma innehåll (samma tree, ren arbetskatalog, samma inställningar) körs inte .NET
+# och testerna om. Typiskt: kör gg, sedan git push.
+cache_file="$(git rev-parse --git-dir 2>/dev/null)/git-guard-ok"
+cache_key=""
+cache_hit=0
+if [ "$(git config --bool --get gitguard.cache 2>/dev/null)" != false ]; then
+  # Bara när exakt en commit pushas och arbetskatalogen är ren (kontrollerna läser den)
+  # shellcheck disable=SC2086
+  if [ -n "$push_shas" ] && [ "$(printf '%s\n' $push_shas | sort -u | wc -l | tr -d ' ')" = 1 ] \
+     && [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+    # shellcheck disable=SC2086
+    tree="$(git rev-parse "$(printf '%s' $push_shas)^{tree}" 2>/dev/null)"
+    settings="$( { git config --get-regexp '^gitguard\.' 2>/dev/null; echo "SKIP_TESTS=${SKIP_TESTS:-0}"; } | git hash-object --stdin)"
+    [ -n "$tree" ] && cache_key="$tree $settings"
+  fi
+  if [ -n "$cache_key" ] && [ -f "$cache_file" ] && [ "$(cat "$cache_file" 2>/dev/null)" = "$cache_key" ]; then
+    cache_hit=1
+  fi
+fi
 
 # --- 7. .NET (PowerShell-kontroller) ----------------------------------------
 dotnet_done=0
@@ -271,8 +306,17 @@ if [ $is_dotnet -eq 1 ] && cfg_bool skipDotnet; then
   record skip ".NET" "gitguard.skipDotnet"
 elif [ $is_dotnet -eq 1 ] && [ $code_changed -eq 0 ]; then
   record skip ".NET" "bara dokumentation ändrad"
+elif [ $is_dotnet -eq 1 ] && [ $dotnet_changed -eq 0 ]; then
+  dotnet_done=1
+  green "Inga .NET-relevanta filer ändrade (bara SQL, pipelines, skript m.m.) – hoppar över .NET"
+  record skip ".NET" "inga .NET-filer ändrade"
+elif [ $is_dotnet -eq 1 ] && [ $cache_hit -eq 1 ]; then
+  dotnet_done=1
+  green "Samma innehåll är redan kontrollerat och grönt – hoppar över .NET och tester"
+  detail "Kör allt ändå: git config gitguard.cache false   (eller ta bort .git/git-guard-ok)"
+  record skip ".NET" "redan kontrollerat"
 fi
-if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; then
+if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && [ $dotnet_done -eq 0 ] && ! cfg_bool skipDotnet; then
   step_t0=$SECONDS
   ps_exe=""
   for c in pwsh pwsh.exe powershell.exe powershell; do
@@ -299,7 +343,8 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; the
              -DriftLevel "$(cfg_enum versionDrift error error warn)"
              -ExistingIssues "$(cfg_enum existingIssues warn warn error)")
     [ "${SKIP_TESTS:-0}" = 1 ] && ps_args+=(-SkipTests)
-    cfg_bool skipFormat && ps_args+=(-SkipFormat)
+    fmt_mode="$(cfg_enum format whitespace whitespace style off)"
+    if cfg_bool skipFormat || [ "$fmt_mode" = off ]; then ps_args+=(-SkipFormat); else ps_args+=(-FormatMode "$fmt_mode"); fi
     [ "$verbose" -eq 1 ] && ps_args+=(-Detailed)
     vcmd "$ps_exe" -File "$check_script" "${ps_args[@]}"
     if "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
@@ -324,6 +369,7 @@ run_tests() {
   fi
   begin "$name"
   vcmd "$@"
+  tests_ran=1
   if "$@"; then
     record ok "$name"
   else
@@ -333,9 +379,13 @@ run_tests() {
   fi
 }
 
+tests_ran=0
 if [ "${SKIP_TESTS:-0}" = 1 ]; then
   yellow "Hoppar över tester (SKIP_TESTS / gitguard.skipTests)"
   record skip "Tester" "SKIP_TESTS / gitguard.skipTests"
+elif [ $cache_hit -eq 1 ]; then
+  [ $is_dotnet -eq 1 ] || green "Samma innehåll är redan kontrollerat och grönt – hoppar över tester"
+  record skip "Tester" "redan kontrollerat"
 elif [ $code_changed -eq 0 ]; then
   [ ${#files[@]} -gt 0 ] && green "Bara dokumentation ändrad – hoppar över tester"
 else
@@ -360,6 +410,15 @@ if run_repo_hooks "$@"; then
   [ "${repo_hook_ran:-0}" = 1 ] && record ok "Repots egen hook"
 else
   fail=1; record fail "Repots egen hook"
+fi
+
+# --- Spara grönt resultat för cachen ---------------------------------------------
+if [ -n "$cache_key" ]; then
+  if [ $fail -eq 0 ] && [ $cache_hit -eq 0 ]; then
+    printf '%s' "$cache_key" > "$cache_file" 2>/dev/null || true
+  elif [ $fail -ne 0 ]; then
+    rm -f "$cache_file" 2>/dev/null || true
+  fi
 fi
 
 # -----------------------------------------------------------------------------

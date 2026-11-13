@@ -36,6 +36,10 @@ param(
     [switch]$SkipBuild,
     [ValidateSet('error', 'warn')]
     [string]$ExistingIssues = 'error',
+    # whitespace: snabb (dotnet format whitespace --folder, laddar inte solutionen)
+    # style: whitespace + kodstil + analyzers enligt .editorconfig (laddar hela solutionen)
+    [ValidateSet('whitespace', 'style')]
+    [string]$FormatMode = 'whitespace',
     # Visa varje dotnet-kommando och hela utdatan (gitguard.verbose / GITGUARD_VERBOSE=1)
     [switch]$Detailed
 )
@@ -62,6 +66,7 @@ function Write-Warn2([string]$m){ $script:WarnCount++;  Write-Host "$E[33m! $m$E
 function Write-Detail([string]$m) {
     if ($script:RootPrefix) { $m = $m.Replace($script:RootPrefix, '').Replace(($script:RootPrefix -replace '\\', '/'), '') }
     $m = $m -replace '\s*\[[^\[\]]+\.(csproj|fsproj|vbproj|sln|slnx)\]\s*$', ''
+    $m = $m -replace '\s*\[\.\]\s*$', ''   # dotnet format --folder
     Write-Host "$E[90m    $m$E[0m"
 }
 function Write-Issue([string]$Level, [string]$m) {
@@ -98,7 +103,34 @@ function Get-NuLabel([string]$Code) {
 # --- Hjälpfunktioner ---------------------------------------------------------
 $ExcludeRx = '[\\/](bin|obj|node_modules|\.git|\.vs|TestResults)[\\/]|[\\/]packages[\\/][^\\/]+\.\d+\.\d+'
 
+# Filer i repot hämtas med git ls-files (spårade + nya, inte ignorerade). Det är mycket snabbare
+# än att gå igenom hela mappträdet med node_modules, bin och obj. Utan git: Get-ChildItem.
+$script:GitFiles = $null
+function Get-GitFileList {
+    if ($null -ne $script:GitFiles) { return $script:GitFiles }
+    $script:GitFiles = @()
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $o = @(& git -c core.quotePath=false ls-files --cached --others --exclude-standard 2>$null)
+        if ($LASTEXITCODE -eq 0) { $script:GitFiles = @($o | Where-Object { $_ } | Select-Object -Unique) }
+        else { $script:GitFiles = $false }
+    } else { $script:GitFiles = $false }
+    return $script:GitFiles
+}
 function Get-RepoFile([string[]]$Include) {
+    $list = Get-GitFileList
+    if ($list -is [array]) {
+        foreach ($rel in $list) {
+            $leaf = Split-Path $rel -Leaf
+            $hit = $false
+            foreach ($pat in $Include) { if ($leaf -like $pat) { $hit = $true; break } }
+            if (-not $hit) { continue }
+            $full = Join-Path (Get-Location).Path $rel
+            if ($full -match $ExcludeRx) { continue }
+            $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+            if ($item -and -not $item.PSIsContainer) { $item }
+        }
+        return
+    }
     Get-ChildItem -Path . -Recurse -File -Include $Include -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch $ExcludeRx }
 }
@@ -478,10 +510,22 @@ if ($SkipFormat) {
     Write-Skip 'Hoppar över formatering (gitguard.skipFormat)'
 } elseif ($codeFiles.Count -eq 0) {
     if ($ChangedFilesPath) { Write-Skip 'Formatering: inga ändrade .cs/.vb/.fs-filer' }
-} elseif (-not $restoreOk) {
+} elseif ($FormatMode -eq 'style' -and -not $restoreOk) {
     Write-Skip 'Hoppar över formatering eftersom restore misslyckades'
 }
-if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
+if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $FormatMode -eq 'whitespace') {
+    # Snabb variant: läser bara filerna och .editorconfig, laddar inte solutionen och kräver ingen restore
+    Write-Step "dotnet format whitespace: $($codeFiles.Count) fil(er)"
+    $out = Invoke-Dotnet (@('format', 'whitespace', '.', '--folder', '--verify-no-changes', '-v', $Verb, '--include') + $codeFiles)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Bad 'Formateringen avviker (mellanslag, indrag eller radslut)'
+        $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_.Trim() }
+        Write-Detail ('Rätta: dotnet format whitespace --folder --include ' + ($codeFiles -join ' ') + '   och committa')
+    } else {
+        Write-Ok 'Formatering ok'
+    }
+}
+if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $FormatMode -eq 'style' -and $restoreOk) {
     $hasEditorConfig = (Test-Path -LiteralPath '.editorconfig')
     $mode = if ($hasEditorConfig) { 'style + whitespace (.editorconfig)' } else { 'whitespace' }
     Write-Step "dotnet format: $($codeFiles.Count) fil(er), $mode"
