@@ -440,6 +440,7 @@ foreach ($t in $targets) {
                 foreach ($c in $codes) { Write-Bad "$(Get-NuLabel $c) ($c)" }
             } else {
                 Write-Bad "dotnet restore misslyckades för $(Split-Path $t -Leaf)"
+                Write-Detail "Rätta: kör dotnet restore $(Split-Path $t -Leaf) och läs felet (ggnet -Detailed visar allt)"
             }
             if ($codes -contains 'NU1301' -or ($out -match 'Unauthorized|Forbidden')) {
                 Write-Detail 'Paketkällan svarar inte eller nekar åtkomst (VPN, proxy eller utgången inloggning).'
@@ -599,12 +600,19 @@ if (-not $SkipBuild -and $restoreOk) {
             if ($i -match '\[([^\[\]]+\.(csproj|fsproj|vbproj))\]\s*$') { $src = @(Get-Rel $Matches[1]) }
             Write-RefIssue 'error' $src $label
             Write-Detail ($i -replace '^.*?warning ', '')
+            $fixText = switch -Regex ($i) {
+                'MSB3277|MSB3243' { 'använd samma version av paketet/DLL:en i alla projekt (dotnet build -v d visar vilka referenser som krockar)'; break }
+                'MSB3245'         { 'rätta HintPath, eller lägg till paketet/DLL:en som saknas'; break }
+                default           { 'kontrollera att referensen passar projektets TargetFramework' }
+            }
+            Write-Detail "Rätta: $fixText"
         }
         if ($code -ne 0) {
             $buildOk = $false
             Write-Bad "Bygget misslyckades: $(Split-Path $t -Leaf)"
             $out | Where-Object { $_ -match ': error ' } | ForEach-Object { ($_).Trim() } |
                 Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_ }
+            Write-Detail "Rätta: rätta felen ovan (dotnet build $(Split-Path $t -Leaf)) och committa"
         }
     }
     if ($buildOk -and $allRefIssues -eq 0) { Write-Ok 'Build ok, inga referenskonflikter' }

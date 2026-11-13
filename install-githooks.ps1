@@ -9,9 +9,11 @@
       -Global          core.hooksPath = ~/.git-guard/hooks (alla repon utan egen hooksPath)
       -Path <mapp>     Letar upp repon och lägger hooken i varje repos .git/hooks.
                        En befintlig pre-push döps om till pre-push.local och körs ändå.
+      -Depth <n>       Hur djupt -Path letar efter repon (standard 3).
       -Interactive     Fråga för varje repo.
       -InstallTools    Installera sqlfluff och gitleaks (och PowerShell 7 om det saknas).
       -Uninstall       Ta bort hooken. Med -Purge tas även ~/.git-guard bort.
+      -Force           Ersätt en global core.hooksPath som pekar någon annanstans (t.ex. husky).
       -WhatIf          Visa vad som skulle hända utan att ändra något.
 
     Kör skriptet igen när du fått en ny version - allt skrivs över och uppdateras.

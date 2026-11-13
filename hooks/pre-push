@@ -3,7 +3,8 @@
 # (raden ovan används av installationsskriptet för att känna igen hooken)
 #
 # Den här filen behöver aldrig ändras. Allt styrs med git config, globalt
-# (git config --global ...) eller per repo (git config ...). Se README.md.
+# (git config --global ...) eller per repo (git config ...). Se README.md eller
+# skriv 'gghelp inställningar' i terminalen. Stegen 0-8 är numrerade som i README.
 #
 #   gitguard.disable            true = stäng av alla kontroller
 #   gitguard.skipTests          true = kör inga tester
@@ -302,7 +303,7 @@ if has_file 'package.json' && [ -f package-lock.json ] && ! has_file 'package-lo
   record warn "npm-låsfil"
 fi
 
-# --- 6. Har kod ändrats? -----------------------------------------------------
+# --- Har kod ändrats? --------------------------------------------------------
 # code_changed:   något annat än dokumentation
 # dotnet_changed: något som kan påverka .NET-bygget (inte SQL, pipelines, skript m.m.)
 code_changed=0
@@ -339,7 +340,7 @@ if [ "$(git config --bool --get gitguard.cache 2>/dev/null)" != false ]; then
   fi
 fi
 
-# --- 7. .NET (PowerShell-kontroller) ----------------------------------------
+# --- 6. .NET (PowerShell-kontroller) ----------------------------------------
 dotnet_done=0
 is_dotnet=0
 if ls ./*.sln ./*.slnx >/dev/null 2>&1 || [ -n "$(find . -maxdepth 5 \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' \) \
@@ -408,7 +409,7 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && [ $dotnet_done -eq 0 ] && 
   fi
 fi
 
-# --- 8. Tester (övriga språk + .NET-reserv) ---------------------------------
+# --- 7. Tester (övriga språk + .NET-reserv) ---------------------------------
 # run_tests <namn> <verktyg> <kommando...> – kör ett testkommando om verktyget finns
 run_tests() {
   local name="$1" tool="$2"; shift 2
@@ -457,7 +458,7 @@ else
   fi
 fi
 
-# --- 9. Repots egna hooks ----------------------------------------------------
+# --- 8. Repots egna hooks ----------------------------------------------------
 step_t0=$SECONDS
 if run_repo_hooks "$@"; then
   [ "${repo_hook_ran:-0}" = 1 ] && record ok "${repo_hook_label:-Repots egen hook}"

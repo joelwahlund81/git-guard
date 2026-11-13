@@ -25,10 +25,14 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 .\install-terminal.ps1
 ```
 
-Starta om Windows Terminal. Nu körs kontrollerna vid varje `git push`. Med `gg` kör du dem utan att pusha.
+Starta om Windows Terminal. Nu körs kontrollerna vid varje `git push`. Med `gg` kör du dem utan
+att pusha. Skriv `gghelp` när du behöver hjälp, och `ggstatus` för att se om allt är på plats.
 
-**Uppdatera:** `cd $HOME\.git-guard; git pull`. Kör `.\install-githooks.ps1 -Global` igen om
-installationsskripten ändrats.
+**PowerShell 7 rekommenderas.** Utan `pwsh` körs .NET-kontrollerna i Windows PowerShell 5.1, som
+inte klarar att läsa stora `project.assets.json` (transitiva beroenden hoppas då över med en varning).
+
+**Uppdatera:** `ggupdate` (eller `cd $HOME\.git-guard; git pull`). Kör `.\install-githooks.ps1 -Global`
+igen om installationsskripten ändrats.
 
 > Klonar du repot någon annanstans, t.ex. `C:\src\git-guard`, kopierar installationsskriptet
 > filerna till `~/.git-guard`. Då kör du installationsskriptet igen efter varje `git pull`.
@@ -73,11 +77,11 @@ eller `git config gitguard.verbose true`.
 | | | `Version=` i projekt trots Central Package Management, saknad `PackageVersion` | ✗ |
 | | | `packages.config`, DLL:er från `packages\`, flytande versioner (`1.*`), `VersionOverride`, samma DLL från olika mappar | ! |
 | 6.2 | Restore | `dotnet restore`, med `--locked-mode` när `packages.lock.json` finns, så att låsfiler i osynk fångas | ✗ |
-| 6.3 | Tredjepartsbibliotek | Nedgraderingar (NU1605), versionskonflikter (NU1107), sårbara paket med hög/kritisk risk (NU1903/1904) | ✗ |
+| 6.3 | Tredjepartsbibliotek | Nedgraderingar (NU1605), versionskonflikter (NU1107, NU1106), sårbara paket med hög/kritisk risk (NU1903/1904) | ✗ |
 | | | Utanför tillåtet intervall (NU1608), .NET Framework-paket (NU1701), sårbarheter med låg/medel risk | ! |
 | | | Ett beroende löses till olika versioner i olika projekt (transitiv drift) | ! |
 | 6.4 | Formatering | `dotnet format whitespace --folder` på ändrade filer: mellanslag, indrag och radslut enligt `.editorconfig`. Tar några sekunder. Med `gitguard.format style` kontrolleras även kodstil och analyzers, men då laddas hela solutionen | ✗ |
-| 6.5 | Build | `dotnet build`: referenskonflikter (MSB3277) och referenser som inte hittas (MSB3245) | ✗ |
+| 6.5 | Build | `dotnet build`: kompileringsfel, referenskonflikter (MSB3277, MSB3243), referenser som inte hittas (MSB3245) och inkompatibla referenser (MSB3274, MSB3275) | ✗ |
 | 6.6 | Test | `dotnet test` om testprojekt finns | ✗ |
 
 \* Blir en varning med `git config gitguard.versionDrift warn`.
@@ -204,7 +208,17 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 .\install-githooks.ps1 -Global -Uninstall           # koppla bort globalt
 .\install-githooks.ps1 -Path C:\src -Uninstall      # ta bort ur repon
 .\install-terminal.ps1 -Theme paradox               # byt Oh My Posh-tema (annars behålls ditt tema)
+.\install-terminal.ps1 -SkipApps -SkipFont          # bara profilen och modulerna, inga program/typsnitt
+.\install-githooks.ps1 -Global -Force               # ersätt en annan global core.hooksPath
+.\install-githooks.ps1 -Path C:\src -Depth 5        # leta djupare efter repon
 ```
+
+| Miljövariabel | Effekt |
+|---|---|
+| `GIT_GUARD_HOME` | Installera/läs git-guard från en annan mapp än `~/.git-guard` |
+| `GITGUARD_POSH_THEME` | Sökväg till ett eget Oh My Posh-tema (vinner över `terminal/theme.omp.json`) |
+| `GITGUARD_VERBOSE=1` | Detaljerad utdata för en push |
+| `SKIP_TESTS=1` | Inga tester för en push (`gpnt` gör det åt dig) |
 
 Installeras hooken per repo döps en befintlig `pre-push` om till `pre-push.local` och körs ändå.
 Repon med husky eller en egen `core.hooksPath` lämnas orörda.
@@ -229,6 +243,7 @@ använder LFS. Har du lagt en egen hook direkt i `~/.git-guard/hooks` skrivs den
 | Push tar för lång tid | `git config gitguard.skipTests true` i repot och låt pipelinen köra testerna |
 | Ikoner visas som rutor | Välj typsnittet **MesloLGM Nerd Font** i Windows Terminal / VS Code |
 | `$'\r': command not found` | Hooken har fått CRLF. Kör `git add --renormalize .` eller installationsskriptet igen |
+| Vad är fel? Vad gäller här? | `ggstatus` och `gghelp felsökning` i terminalen |
 
 ---
 
