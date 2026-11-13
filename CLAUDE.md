@@ -96,35 +96,46 @@ format (kräver restore) → build (`--no-restore`) → test (`--no-build`).
 Kör alltid innan commit:
 
 ```powershell
-bash -n hooks/pre-push                       # syntax
-shellcheck hooks/pre-push                    # om installerat
-Invoke-ScriptAnalyzer -Path . -Recurse       # Install-Module PSScriptAnalyzer
-# parse-test i båda PowerShell-versionerna:
-pwsh       -NoProfile -Command "[void][Management.Automation.Language.Parser]::ParseFile('checks/dotnet-check.ps1',[ref]`$null,[ref]`$null)"
-powershell -NoProfile -File checks/dotnet-check.ps1 -RepoRoot <testrepo> -SkipTests
+.\tests\run-tests.ps1 -Quick        # syntax, BOM, radslut, parse, dokumentation i synk (sekunder)
+.\tests\run-tests.ps1              # + alla funktionstester nedan (några minuter, kräver dotnet och nätverk)
+.\tests\run-tests.ps1 -Only drift  # bara vissa scenarier (namn eller del av namn, kommaseparerat)
 ```
 
-Funktionstest, i ett testrepo med sln och 2–3 classlib-projekt:
+Kör den i **både** `pwsh` och `powershell` (5.1). CI (`.github/workflows/ci.yml`) kör samma
+svit på Windows och Linux, PSScriptAnalyzer, shellcheck och ett röktest med macOS `/bin/bash` 3.2.
+Testerna använder en egen `GIT_CONFIG_GLOBAL`, så din git config påverkas inte och påverkar inte.
+
+Funktionstesterna (`$scenarios` i `tests/run-tests.ps1`) skapar repon med en lokal remote och kör
+hooken som `git push` gör. Lägg till ett scenario för varje ny kontroll eller rättad bugg:
 
 | Scenario | Förväntat |
 |---|---|
-| Samma paket med olika `Version` i två projekt | Fel: versionsdrift (+ NU1605 om de refererar varandra) |
+| Samma paket med olika `Version` i två projekt (ändrat i pushen) | Fel: versionsdrift |
+| Samma drift, men pushen rör inte projektfilerna | Varning "(fanns redan)", fel med `existingIssues=error` |
 | `<Reference><HintPath>` till en DLL med samma namn som ett NuGet-paket | Fel: DLL + NuGet |
 | Samma DLL i två olika versioner | Fel: DLL-konflikt |
 | Samma DLL (samma version) från två olika mappar | Varning |
 | packages.config-projekt med `..\packages\Id.1.2.3\lib\...` | Bara varning om packages.config, inget DLL+NuGet-fel |
 | Olika versioner av ett paket i villkorade ItemGroups (per TFM) | Ingen drift |
-| Projekt med `ManagePackageVersionsCentrally=false` i ett CPM-repo | Inget CPM-fel |
+| Projekt med `ManagePackageVersionsCentrally=false` i ett CPM-repo | Inget CPM-fel. `Version=` i ett CPM-projekt: fel |
 | `RestorePackagesWithLockFile` + ändrad version utan ny låsfil | Fel: låsfil i osynk (NU1004) |
-| Projekt A får paket X 2.0 transitivt, projekt B har X 1.0 direkt | Varning: transitiv drift |
+| Projekt A får paket X 8.0 transitivt, projekt B har X 6.0 direkt | Varning: transitiv drift |
 | Felaktiga mellanslag i ändrad `.cs` | Fel: formatering |
-| Rent repo | Allt grönt, push går igenom |
+| Test som failar / samma med `gitguard.testFilter` | Fel / grönt |
+| Bara `.sql` eller bara dokumentation ändrad | .NET hoppas över |
+| Skyddad branch, konfliktmarkörer | Fel |
+| Ocommittad ändring i en pushad fil | Varning |
+| `gg` (torrkörning) med en egen repo-hook | Hooken körs inte (men vid riktig push) |
+| `commit-msg` i `.git/hooks` med git-guard som `core.hooksPath` | Körs via passthrough |
+| Hemlighet tillagd och borttagen i historiken (kräver gitleaks) | Fel |
+| Rent repo, två gånger | Grönt, andra gången från cachen |
 
-Kör också:
-- `gg` i testrepot (torrkörning utan push)
+Testa också för hand när du ändrar installationen eller terminalen:
+- `gg`, `gghelp`, `ggstatus` och tab-komplettering i en ny terminal (`reload` efter ändring)
 - `install-githooks.ps1 -WhatIf`
 - en hel installation och avinstallation mot en tillfällig HOME:
   `$env:HOME`/`$env:USERPROFILE` = tom mapp
+- `install-terminal.ps1` två gånger: ett ändrat tema och `bookmarks.json` ska finnas kvar
 
 ## Commits
 

@@ -296,4 +296,5 @@ Hooks kan alltid kringgås. Det som måste stoppas bör därför också finnas p
 
 ---
 
-Utvecklar du git-guard: läs [CLAUDE.md](CLAUDE.md) för regler och testscenarier.
+Utvecklar du git-guard: läs [CLAUDE.md](CLAUDE.md) för regler och testscenarier, och kör
+`.\tests\run-tests.ps1` innan du committar.

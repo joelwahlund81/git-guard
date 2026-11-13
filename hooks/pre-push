@@ -420,7 +420,6 @@ run_tests() {
   fi
   begin "$name"
   vcmd "$@"
-  tests_ran=1
   if "$@"; then
     record ok "$name"
   else
@@ -430,7 +429,6 @@ run_tests() {
   fi
 }
 
-tests_ran=0
 if [ "${SKIP_TESTS:-0}" = 1 ]; then
   yellow "Hoppar över tester (SKIP_TESTS / gitguard.skipTests)"
   record skip "Tester" "SKIP_TESTS / gitguard.skipTests"

@@ -166,8 +166,10 @@ function global:Remove-GGBinObj {
     param([switch]$Yes)
     $root = Get-GGRoot
     # Bara bin/obj bredvid en projektfil, så att t.ex. en bin-mapp med skript inte tas bort
-    $projDirs = @(Get-ChildItem -LiteralPath $root -Recurse -File -Include '*.csproj', '*.fsproj', '*.vbproj' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '[\\/](node_modules|\.git)[\\/]' } | ForEach-Object { $_.DirectoryName } | Select-Object -Unique)
+    # (-Include fungerar inte med -LiteralPath i Windows PowerShell 5.1, därför Where-Object)
+    $projDirs = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.csproj', '.fsproj', '.vbproj') -and $_.FullName -notmatch '[\\/](node_modules|\.git)[\\/]' } |
+        ForEach-Object { $_.DirectoryName } | Select-Object -Unique)
     $dirs = @(foreach ($d in $projDirs) {
         foreach ($n in @('bin', 'obj')) { $p = Join-Path $d $n; if (Test-Path -LiteralPath $p -PathType Container) { $p } }
     })
@@ -196,7 +198,7 @@ function global:Open-GGSolution {
     if ($wanted -and (Test-Path -LiteralPath (Join-Path $root $wanted))) { $sln = Get-Item -LiteralPath (Join-Path $root $wanted) }
     if (-not $sln) {
         $sln = @(Get-ChildItem -Path (Join-Path $root '*') -File -Include '*.sln', '*.slnx' -ErrorAction SilentlyContinue) +
-               @(Get-ChildItem -LiteralPath $root -Recurse -Depth 2 -File -Include '*.sln', '*.slnx' -ErrorAction SilentlyContinue) |
+               @(Get-ChildItem -LiteralPath $root -Recurse -Depth 2 -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.sln', '.slnx') }) |
                Select-Object -First 1
     }
     if (-not $sln) { Write-GGNote "Hittar ingen .sln/.slnx i $root"; return }
