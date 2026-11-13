@@ -19,6 +19,9 @@
 #   gitguard.sqlLint            error | warn | off – standard: error om repot har .sqlfluff,
 #                               annars warn
 #   gitguard.sqlDialect         tsql (standard) – ignoreras om repot har .sqlfluff
+#   gitguard.solution           sökväg till .sln/.slnx när repot har flera
+#   gitguard.testFilter         filter till dotnet test, t.ex. "Category!=Integration"
+#   gitguard.testTimeout        t.ex. "5m" = avbryt tester som hänger (--blame-hang-timeout)
 #   gitguard.protectedBranches  t.ex. "main master" = blockera direkt push dit
 #   gitguard.verbose            true = visa filer, kommandon och full utdata
 #
@@ -346,6 +349,9 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && [ $dotnet_done -eq 0 ] && 
     fmt_mode="$(cfg_enum format whitespace whitespace style off)"
     if cfg_bool skipFormat || [ "$fmt_mode" = off ]; then ps_args+=(-SkipFormat); else ps_args+=(-FormatMode "$fmt_mode"); fi
     [ "$verbose" -eq 1 ] && ps_args+=(-Detailed)
+    [ -n "$(cfg solution)" ]    && ps_args+=(-Solution "$(cfg solution)")
+    [ -n "$(cfg testFilter)" ]  && ps_args+=(-TestFilter "$(cfg testFilter)")
+    [ -n "$(cfg testTimeout)" ] && ps_args+=(-TestTimeout "$(cfg testTimeout)")
     vcmd "$ps_exe" -File "$check_script" "${ps_args[@]}"
     if "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
          -File "$(to_native "$check_script")" "${ps_args[@]}"; then
@@ -390,7 +396,10 @@ elif [ $code_changed -eq 0 ]; then
   [ ${#files[@]} -gt 0 ] && green "Bara dokumentation ändrad – hoppar över tester"
 else
   if [ $is_dotnet -eq 1 ] && [ $dotnet_done -eq 0 ]; then
-    run_tests "dotnet test" dotnet dotnet test --nologo -v q
+    dt_args=(test --nologo -v q)
+    [ -n "$(cfg testFilter)" ]  && dt_args+=(--filter "$(cfg testFilter)")
+    [ -n "$(cfg testTimeout)" ] && dt_args+=(--blame-hang-timeout "$(cfg testTimeout)")
+    run_tests "dotnet test" dotnet dotnet "${dt_args[@]}"
   fi
   if [ -f package.json ] && grep -q '"test"[[:space:]]*:' package.json \
      && ! grep -q 'no test specified' package.json; then

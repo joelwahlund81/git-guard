@@ -40,6 +40,12 @@ param(
     # style: whitespace + kodstil + analyzers enligt .editorconfig (laddar hela solutionen)
     [ValidateSet('whitespace', 'style')]
     [string]$FormatMode = 'whitespace',
+    # Solution att bygga när det finns flera (gitguard.solution), relativ till repots rot
+    [string]$Solution,
+    # Skickas till dotnet test --filter, t.ex. "Category!=Integration" (gitguard.testFilter)
+    [string]$TestFilter,
+    # Skickas till dotnet test --blame-hang-timeout, t.ex. "5m" (gitguard.testTimeout)
+    [string]$TestTimeout,
     # Visa varje dotnet-kommando och hela utdatan (gitguard.verbose / GITGUARD_VERBOSE=1)
     [switch]$Detailed
 )
@@ -190,9 +196,23 @@ if ($solutions.Count -eq 0) {
     $solutions = @(Get-ChildItem -Path . -File -Recurse -Depth 2 -Include '*.sln', '*.slnx' -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch $ExcludeRx })
 }
+$targetIsSolution = $false
+if ($Solution) {
+    $slnPath = Join-Path (Get-Location).Path $Solution
+    if (Test-Path -LiteralPath $slnPath -PathType Leaf) {
+        $solutions = @(Get-Item -LiteralPath $slnPath)
+    } else {
+        Write-Warn2 "gitguard.solution pekar på '$Solution', som inte finns - väljer automatiskt"
+        Write-Detail 'Rätta: git config gitguard.solution <sökväg till .sln/.slnx från repots rot>'
+    }
+}
 if ($solutions.Count -gt 0) {
     $targets = @($solutions[0].FullName)
-    if ($solutions.Count -gt 1) { Write-Detail "Flera solutions hittades, använder $(Get-Rel $solutions[0].FullName)" }
+    $targetIsSolution = $true
+    if ($solutions.Count -gt 1) {
+        Write-Detail "Flera solutions hittades, använder $(Get-Rel $solutions[0].FullName)"
+        Write-Detail "Välj en annan: git config gitguard.solution $(Get-Rel $solutions[1].FullName)"
+    }
 } else {
     $targets = @($projects | ForEach-Object { $_.FullName })
 }
@@ -421,6 +441,13 @@ foreach ($t in $targets) {
             } else {
                 Write-Bad "dotnet restore misslyckades för $(Split-Path $t -Leaf)"
             }
+            if ($codes -contains 'NU1301' -or ($out -match 'Unauthorized|Forbidden')) {
+                Write-Detail 'Paketkällan svarar inte eller nekar åtkomst (VPN, proxy eller utgången inloggning).'
+                Write-Detail 'Rätta: anslut VPN, eller logga in mot Azure Artifacts:  dotnet restore --interactive'
+                Write-Detail '       (kräver Azure Artifacts Credential Provider: https://aka.ms/artifacts-credprovider)'
+            } elseif (@($codes | Where-Object { $_ -match 'NU110[1-3]' }).Count -gt 0) {
+                Write-Detail 'Rätta: kontrollera paketnamn och version, och att rätt paketkällor finns:  dotnet nuget list source'
+            }
         }
         $out | Where-Object { $_ -match 'error' } |
             ForEach-Object { ($_ -replace '^.*?error (NU\d{4}: )?', '' -replace 'Warning As Error: ', '').Trim() } |
@@ -595,13 +622,24 @@ if (-not $SkipTests) {
     } elseif (-not $restoreOk -or (-not $SkipBuild -and -not $buildOk)) {
         Write-Warn2 'Hoppar över tester eftersom restore/build misslyckades'
     } else {
-        Write-Step "dotnet test ($($testProjects.Count) testprojekt)"
-        foreach ($t in $targets) {
+        # Utan solution körs bara testprojekten, inte alla projekt
+        $testTargets = if ($targetIsSolution) { $targets } else { @($testProjects | ForEach-Object { $_.FullName }) }
+        $extra = ''
+        if ($TestFilter) { $extra += ", filter: $TestFilter" }
+        if ($TestTimeout) { $extra += ", timeout: $TestTimeout" }
+        Write-Step "dotnet test ($($testProjects.Count) testprojekt$extra)"
+        foreach ($t in $testTargets) {
             $dnArgs = @('test', $t, '--nologo', '-v', $Verb)
             if (-not $SkipBuild) { $dnArgs += '--no-build' } else { $dnArgs += '--no-restore' }
+            if ($TestFilter) { $dnArgs += @('--filter', $TestFilter) }
+            if ($TestTimeout) { $dnArgs += @('--blame-hang-timeout', $TestTimeout) }
             if ($Detailed) { Write-Host "$E[90m    `$ dotnet $($dnArgs -join ' ')$E[0m" }
             & dotnet @dnArgs 2>&1 | ForEach-Object { Write-Host "    $_" }
-            if ($LASTEXITCODE -ne 0) { Write-Bad 'Tester misslyckades' } else { Write-Ok 'Tester ok' }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Bad "Tester misslyckades$(if (-not $targetIsSolution) { ': ' + (Split-Path $t -Leaf) })"
+                Write-Detail 'Rätta: rätta testerna ovan (dotnet test), eller pusha utan tester en gång: SKIP_TESTS=1 git push'
+                Write-Detail '       Tester som kräver databas/Azure: git config gitguard.testFilter "Category!=Integration"'
+            } else { Write-Ok 'Tester ok' }
         }
     }
 }

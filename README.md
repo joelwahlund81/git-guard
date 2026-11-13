@@ -134,6 +134,9 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.versionDrift` | `warn` | Versionsdrift varnar i stället för att stoppa |
 | `gitguard.existingIssues` | `warn` (standard) / `error` | Problem i .NET-filer som pushen inte rör varnar med "(fanns redan)" i stället för att stoppa |
 | `gitguard.sqlLint` | `error` / `warn` / `off` | Hur SQL-lint ska räknas. Standard: `error` om repot har `.sqlfluff`, annars `warn` |
+| `gitguard.solution` | `src/App.sln` | Vilken solution som byggs när repot har flera (standard: den första i bokstavsordning) |
+| `gitguard.testFilter` | `"Category!=Integration"` | Filter till `dotnet test`, t.ex. för att hoppa över tester som kräver databas eller Azure |
+| `gitguard.testTimeout` | `5m` | Avbryt tester som hänger (`--blame-hang-timeout`) i stället för att pushen fastnar |
 | `gitguard.sqlDialect` | `postgres` m.fl. | Annan SQL-dialekt (en `.sqlfluff` i repot vinner) |
 | `gitguard.protectedBranches` | `"main master"` | Blockera direkt push till de brancherna |
 | `gitguard.verbose` | `true` | Visa vilka filer som ingår, varje kommando och full dotnet-utdata |
@@ -163,6 +166,8 @@ Repon med husky eller en egen `core.hooksPath` lämnas orörda.
 | "running scripts is disabled" | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | Hooken körs inte i ett repo | Kolla `git config core.hooksPath`. Har repot en egen (husky) gäller inte den globala |
 | "PowerShell saknas" | `winget install Microsoft.PowerShell` |
+| Restore: "Kunde inte nå paketkällan" (NU1301) eller 401 | Anslut VPN, eller logga in mot Azure Artifacts med `dotnet restore --interactive` ([Credential Provider](https://aka.ms/artifacts-credprovider)) |
+| Integrationstester failar lokalt | `git config gitguard.testFilter "Category!=Integration"` |
 | Push tar för lång tid | `git config gitguard.skipTests true` i repot och låt pipelinen köra testerna |
 | Ikoner visas som rutor | Välj typsnittet **MesloLGM Nerd Font** i Windows Terminal / VS Code |
 | `$'\r': command not found` | Hooken har fått CRLF. Kör `git add --renormalize .` eller installationsskriptet igen |
