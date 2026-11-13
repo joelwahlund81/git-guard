@@ -148,4 +148,4 @@ if ($existing -match 'git-guard-profile') {
 }
 
 Write-Host "`nKlart! Stäng och öppna Windows Terminal igen." -ForegroundColor Green
-Write-Host "Skriv 'aliases' för att se dina kommandon och 'gg' för att köra git-guard utan att pusha." -ForegroundColor DarkGray
+Write-Host "Skriv 'gghelp' för hjälp, 'ggstatus' för att se om git-guard är aktivt och 'gg' för att köra kontrollerna utan att pusha." -ForegroundColor DarkGray

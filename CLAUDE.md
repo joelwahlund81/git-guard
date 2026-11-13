@@ -16,7 +16,10 @@ hooks/<övriga>           Bash. Vidarekoppling till repots .git/hooks (och git l
 checks/dotnet-check.ps1  PowerShell. Alla .NET-kontroller, anropas från hooken.
 install-githooks.ps1     Installerar till ~/.git-guard och kopplar in hooken globalt/per repo.
 install-terminal.ps1     Oh My Posh, Nerd Font, moduler och kopplar in terminal/profile.ps1.
-terminal/profile.ps1     PowerShell-profil: prompt, kommandon (gg, ggnet, guard, aliases ...).
+terminal/profile.ps1     PowerShell-profil: prompt och kommandotabellen $MyCommands.
+terminal/commands.ps1    Funktionerna bakom kommandona (git, .NET, Azure, ggupdate ...).
+terminal/navigation.ps1  repo/repos och bokmärken (mark, jump, marks, unmark).
+terminal/help.ps1        gghelp, ggstatus, startmeddelandet och listan $GGSettings.
 README.md                Användardokumentation. Håll den i synk med koden.
 ```
 
@@ -27,7 +30,10 @@ Installerat läge: allt kopieras till `~/.git-guard` (eller `$GIT_GUARD_HOME`).
 
 1. **Användaren ska aldrig behöva ändra i filerna.** Nya beteenden styrs med
    `git config gitguard.<namn>` och har en säker standard. Varje ny inställning dokumenteras på
-   tre ställen: hookens header, tabellen i README och `cfg`/`cfg_bool`-anropet.
+   fyra ställen: hookens header, tabellen i README, `$GGSettings` i `terminal/help.ps1` och
+   `cfg`/`cfg_bool`/`cfg_enum`-anropet. Ett nytt kommando läggs i `$MyCommands` (med `Group`,
+   `Desc` och gärna `Help`) och i README. Kontrollera att namnet inte redan är ett inbyggt alias
+   (`Get-Command <namn>`).
 2. **Markörraden** `# git-guard pre-push hook` ska stå på rad 2 i `hooks/pre-push`.
    Installationsskriptet och hooken använder den för att känna igen sig själva. Ändra den aldrig.
 3. **Fel stoppar, varningar informerar.** Använd `red`/`Write-Bad` bara när pushen verkligen ska
@@ -40,7 +46,8 @@ Installerat läge: allt kopieras till `~/.git-guard` (eller `$GIT_GUARD_HOME`).
    fortsätta, inte krascha. Använd `command -v` / `Get-Command` innan anrop.
 6. **Idempotenta installationer.** Skripten ska kunna köras om och om igen. Skriv aldrig över
    användarens egna filer: `terminal/my-commands.ps1`, `terminal/theme.omp.json`,
-   git config-inställningar eller en befintlig repo-hook. En befintlig hook döps om till
+   `terminal/bookmarks.json`, git config-inställningar, en befintlig repo-hook eller en egen hook
+   i `~/.git-guard/hooks`. En befintlig hook döps om till
    `pre-push.local` och körs ändå.
 7. **Text till användaren är på svenska**, kort och konkret. Ett fel följs av en rad som
    börjar med `Rätta:` med kommandot som löser det.
@@ -67,6 +74,9 @@ Installerat läge: allt kopieras till `~/.git-guard` (eller `$GIT_GUARD_HOME`).
 - Använd aldrig `$args` som eget variabelnamn (automatisk variabel). Använd t.ex. `$dnArgs`.
 - `Get-ChildItem -Include` fungerar bara med `-Recurse` eller en sökväg med jokertecken.
 - Färger skrivs som ANSI (`$E = [char]27`) så att de syns även när hooken körs från Git Bash.
+- I `terminal/` definieras allt med `function global:` och `$global:`, så att `reload` kan ladda
+  om profilen inifrån en funktion. Tab-komplettering för en funktion kräver en namngiven
+  parameter (`Register-ArgumentCompleter -ParameterName`).
 - XML i projektfiler läses namnrymdsoberoende: `SelectNodes("//*[local-name()='X']")`.
 
 ## .NET-kontrollerna

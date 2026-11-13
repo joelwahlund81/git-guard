@@ -94,26 +94,76 @@ Varje fel följs av en rad `Rätta: ...` med kommandot som löser det.
 
 ## Kommandon i terminalen
 
-| Kommando | Gör |
+**Hjälp när du behöver den:** `gghelp` ger en översikt. `gghelp <ämne>` går djupare, och ämnen
+och kommandon kan tab-kompletteras.
+
+| Hjälp | Visar |
 |---|---|
-| `gg` | Kör alla kontroller utan att pusha. Repots egna hooks (t.ex. git lfs) körs inte |
-| `ggnet` | Kör bara .NET-kontrollerna på hela repot |
-| `guard` | Slå av/på git-guard i aktuellt repo |
-| `aliases` | Visa alla egna kommandon |
-| `gs` / `gl` | Kort status / commit-graf |
-| `gp` / `gpf` | Push / säker force-push (`--force-with-lease`) |
-| `gco` / `gclean` | Byt branch / ta bort lokala brancher som är borta på remote |
-| `dt` / `azs` | `dotnet test` / aktiv Azure-subscription |
+| `gghelp` | Status och en översikt över alla kommandon |
+| `gghelp kommandon` | Alla kommandon med beskrivning (samma som `aliases`) |
+| `gghelp <kommando>` | Detaljer och exempel, t.ex. `gghelp gnb` |
+| `gghelp inställningar` | Alla `gitguard.*`-inställningar, vad som gäller i det här repot och var värdet kommer ifrån |
+| `gghelp steg` / `gghelp felsökning` | Vad som händer vid push / vanliga problem och lösningar |
+| `gghelp repo` | Hoppa mellan repon och mappar |
+| `gghelp readme` | Öppnar den här filen |
+| `ggstatus` | Är git-guard aktivt här, och hur? Vilka verktyg saknas? Vilka inställningar är satta? |
 
-Undantag för en enskild push: `git push --no-verify` (allt) eller
-`$env:SKIP_TESTS=1; git push; Remove-Item Env:SKIP_TESTS` (tester). Glöm inte den sista delen:
-annars gäller `SKIP_TESTS` för alla pushar tills terminalen stängs.
+När terminalen startar visar Windows Terminal en kort lista över kommandona, och andra fönster
+(t.ex. VS Code) visar en rad med status. Det styrs med
+`git config --global gitguard.startup full|short|off`.
 
-**Egna kommandon:** skapa `~/.git-guard/terminal/my-commands.ps1`. Filen ignoreras av git och
-skrivs aldrig över.
+| Grupp | Kommando | Gör |
+|---|---|---|
+| git | `gs` / `gl` | Kort status / commit-graf |
+| | `gd` / `gds` | Diff / diff av det som är stagat |
+| | `gsw <branch>` / `gco` | Byt branch (tab kompletterar) / `git checkout` |
+| | `gnb <namn>` | Ny branch från senaste `main`/`master` på servern |
+| | `gsync` | Hämta och lägg din branch ovanpå senaste `main`/`master` (rebase) |
+| | `gamend` / `gundo` | Lägg till i senaste commit / ångra senaste commit men behåll ändringarna (frågar om den är pushad) |
+| | `gst` / `gstp` | Lägg undan / ta tillbaka ändringar (stash) |
+| | `gp` / `gpf` | Push / säker force-push (`--force-with-lease`) |
+| | `gpnt` | Push utan tester, bara den gången |
+| | `gpr` / `gweb` | Öppna "skapa PR" / repot i webbläsaren (Azure DevOps och GitHub) |
+| | `gclean` | Ta bort lokala brancher som är borta på servern |
+| .NET | `db` / `dr` / `dw` / `dt` | `dotnet build` / `run` / `watch` / `test` |
+| | `dclean` | Ta bort alla `bin/` och `obj/` bredvid projektfiler (frågar först) |
+| | `dout` / `dvuln` | Paket med nyare versioner / sårbara paket (även transitiva) |
+| | `nugetclear` | Töm NuGet-cachen (frågar först) |
+| | `sln` | Öppna repots `.sln` i Visual Studio |
+| Azure | `azs` / `azl` / `azset <namn>` | Aktiv subscription / logga in / byt subscription (tab kompletterar) |
+| Navigering | `repo <namn>` / `repos` | Hoppa till ett repo / lista repon (se nedan) |
+| | `mark` / `jump` / `marks` / `unmark` | Bokmärken för vilken mapp som helst |
+| git-guard | `gg` | Kör alla kontroller utan att pusha. Repots egna hooks (t.ex. git lfs) körs inte |
+| | `ggnet` | Kör bara .NET-kontrollerna på hela repot (`-SkipTests`, `-SkipFormat`, `-SkipBuild`, `-Detailed`, `-FormatMode style`, `-DriftLevel warn`) |
+| | `guard` | Slå av/på git-guard i aktuellt repo |
+| | `ggupdate` | Uppdatera git-guard (`git pull`) och ladda om profilen |
+| | `ggedit` / `reload` | Öppna dina egna kommandon / ladda om profilen |
+
+Undantag för en enskild push: `git push --no-verify` (allt) eller `gpnt` (tester). Sätter du
+`$env:SKIP_TESTS=1` själv gäller den alla pushar tills terminalen stängs.
+
+### Hoppa mellan repon och mappar
+
+```powershell
+repo api                 # går till repot vars namn innehåller "api" (tab kompletterar)
+repos -Status            # alla repon med branch och antal ändrade filer
+mark loggar              # spara mappen du står i ...
+jump loggar              # ... och hoppa dit senare
+mark api -Alias          # skapar även kommandot "api"
+```
+
+Repon letas två nivåer ned under `~/source/repos` och `~/src`. Har du dem någon annanstans:
+`git config --global gitguard.repoRoots "C:\src;C:\jobb"`. Nytt repo? `repos -Refresh`.
+Bokmärken sparas i `~/.git-guard/terminal/bookmarks.json`, som aldrig skrivs över.
+
+### Egna kommandon
+
+Kör `ggedit`. Det skapar `~/.git-guard/terminal/my-commands.ps1` med exempel och öppnar filen.
+Filen ignoreras av git och skrivs aldrig över. Spara och kör `reload`.
 
 ```powershell
 $MyCommands['kod'] = @{ Cmd = { code . }; Desc = 'Öppna VS Code här' }
+$MyCommands['api'] = @{ Cmd = { Set-Location C:\src\api }; Desc = 'Gå till api-repot'; Group = 'Jobb'; Help = 'Längre text till gghelp api' }
 ```
 
 ---
@@ -140,6 +190,8 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.sqlDialect` | `postgres` m.fl. | Annan SQL-dialekt (en `.sqlfluff` i repot vinner) |
 | `gitguard.protectedBranches` | `"main master"` | Blockera direkt push till de brancherna |
 | `gitguard.verbose` | `true` | Visa vilka filer som ingår, varje kommando och full dotnet-utdata |
+| `gitguard.startup` | `full` / `short` / `off` | Startmeddelandet i terminalen (standard: `full` i Windows Terminal, annars `short`) |
+| `gitguard.repoRoots` | `"C:\src;C:\jobb"` | Mappar där `repo` letar efter repon (global, standard `~/source/repos;~/src`) |
 
 ---
 

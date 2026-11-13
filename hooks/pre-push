@@ -27,6 +27,8 @@
 #
 # Engångsundantag:  git push --no-verify   |   SKIP_TESTS=1 git push
 #                   GITGUARD_VERBOSE=1 git push   (detaljerad utdata en gång)
+#
+# Terminalprofilen (terminal/) läser dessutom gitguard.startup och gitguard.repoRoots.
 
 set -uo pipefail
 
@@ -476,6 +478,7 @@ fi
 print_summary
 if [ $fail -ne 0 ]; then
   if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then red "Kontrollerna hittade fel (se ovan)"; else red "Push avbruten. Fixa felen ovan eller kör: git push --no-verify"; fi
+  detail "Hjälp: gghelp felsökning  |  $GG_HOME/README.md"
   exit 1
 fi
 if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then green "Alla kontroller ok (ingen push gjordes)"; else green "Alla kontroller ok – pushar"; fi
