@@ -37,6 +37,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Marker   = '# git-guard pre-push hook'
+$PassMarker = '# git-guard passthrough hook'
 $IsWin    = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
 $Source   = $PSScriptRoot
 $GGHome   = if ($env:GIT_GUARD_HOME) { $env:GIT_GUARD_HOME } else { Join-Path $HOME '.git-guard' }
@@ -69,6 +70,25 @@ function Copy-Hook([string]$From, [string]$To) {
     Set-Executable $To
 }
 
+# Kopierar alla hooks till ~/.git-guard/hooks med LF-radslut. En hook med samma namn som
+# användaren lagt dit själv skrivs inte över (en git-lfs-hook får ersättas: passthrough-
+# skriptet kör git lfs själv).
+function Copy-AllHooks {
+    foreach ($h in Get-ChildItem -LiteralPath (Join-Path $Source 'hooks') -File) {
+        $dest = Join-Path $HooksDir $h.Name
+        if (Test-Path -LiteralPath $dest) {
+            $head = @(Get-Content -LiteralPath $dest -TotalCount 3 -ErrorAction SilentlyContinue)
+            $ours = ($head -contains $Marker) -or ($head -contains $PassMarker)
+            $isLfs = [bool](Select-String -LiteralPath $dest -Pattern 'git lfs|git-lfs' -Quiet -ErrorAction SilentlyContinue)
+            if (-not $ours -and -not $isLfs) {
+                Write-Note "Behåller din egen hooks/$($h.Name) i $HooksDir (git-guard:s version kopieras inte)"
+                continue
+            }
+        }
+        Copy-Hook $h.FullName $dest
+    }
+}
+
 function Install-Package {
     if ([IO.Path]::GetFullPath($Source).TrimEnd('\', '/') -eq [IO.Path]::GetFullPath($GGHome).TrimEnd('\', '/')) {
         Write-Good "Kör från $GGHome - inget att kopiera"
@@ -79,10 +99,10 @@ function Install-Package {
     }
     if ($PSCmdlet.ShouldProcess($GGHome, 'Kopiera git-guard')) {
         New-Item -ItemType Directory -Path $GGHome -Force | Out-Null
-        foreach ($item in Get-ChildItem -LiteralPath $Source -Force | Where-Object { $_.Name -notin @('.git') }) {
+        foreach ($item in Get-ChildItem -LiteralPath $Source -Force | Where-Object { $_.Name -notin @('.git', 'hooks') }) {
             Copy-Item -LiteralPath $item.FullName -Destination $GGHome -Recurse -Force
         }
-        Copy-Hook (Join-Path $Source 'hooks/pre-push') (Join-Path $HooksDir 'pre-push')
+        Copy-AllHooks
         Write-Good "Kopierat till $GGHome"
     }
 }
@@ -202,6 +222,7 @@ if ($Global) {
         git config --global core.hooksPath $gitPath
         Write-Good "Global hook aktiv: $gitPath"
         Write-Note 'Repon med egen core.hooksPath (t.ex. husky) använder inte den globala hooken.'
+        Write-Note 'Repots egna hooks i .git/hooks (pre-commit, commit-msg, git-lfs m.fl.) körs fortfarande via git-guard.'
     }
 }
 

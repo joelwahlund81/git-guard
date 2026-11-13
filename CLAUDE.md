@@ -11,6 +11,8 @@ Användaren är en enskild utvecklare som kör Windows, Git for Windows och Powe
 
 ```
 hooks/pre-push           Bash. Orkestrerar allt och körs av Git (även i Git Bash på Windows).
+hooks/<övriga>           Bash. Vidarekoppling till repots .git/hooks (och git lfs) när core.hooksPath
+                         är global. Alla är identiska; markör: # git-guard passthrough hook.
 checks/dotnet-check.ps1  PowerShell. Alla .NET-kontroller, anropas från hooken.
 install-githooks.ps1     Installerar till ~/.git-guard och kopplar in hooken globalt/per repo.
 install-terminal.ps1     Oh My Posh, Nerd Font, moduler och kopplar in terminal/profile.ps1.

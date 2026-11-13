@@ -49,7 +49,7 @@ Hooken går igenom stegen i ordning. Ett **✗** stoppar pushen, ett **!** är b
 | 5 | npm-låsfil | `package.json` ändrad men inte `package-lock.json` | ! |
 | 6 | .NET | Kör `checks/dotnet-check.ps1`, se nedan | ✗ |
 | 7 | Tester | `npm test`, `pytest` eller `go test` om sådana projekt finns | ✗ |
-| 8 | Repots egen hook | Kör repots egen `pre-push` / `pre-push.local` om den finns | ✗ |
+| 8 | Repots egen hook | Kör repots egen `pre-push` / `pre-push.local` om den finns. Använder repot git-lfs utan egen hook körs `git lfs pre-push` | ✗ |
 
 Ändras bara dokumentation (`.md`, `.txt`, bilder, mappen `docs/`) hoppas steg 6–7 över.
 Ändras bara sådant som inte påverkar .NET-bygget (`.sql`, `.yml`, `.ps1`, `.sh`, `Dockerfile` m.m.)
@@ -156,6 +156,12 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 
 Installeras hooken per repo döps en befintlig `pre-push` om till `pre-push.local` och körs ändå.
 Repon med husky eller en egen `core.hooksPath` lämnas orörda.
+
+**Repots andra hooks fortsätter att fungera.** Med en global `core.hooksPath` slutar git normalt att
+köra hooks i `.git/hooks`. Därför finns små vidarekopplande skript i `hooks/` (`pre-commit`,
+`commit-msg`, `prepare-commit-msg`, `post-commit`, `post-checkout`, `post-merge`, `post-rewrite`,
+`pre-rebase`). De kör repots egen hook med samma namn om den finns, och `git lfs` i repon som
+använder LFS. Har du lagt en egen hook direkt i `~/.git-guard/hooks` skrivs den inte över.
 
 ---
 

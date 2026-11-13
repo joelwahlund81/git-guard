@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# git-guard passthrough hook
+# (raden ovan används för att känna igen skriptet – ändra den inte)
+#
+# När core.hooksPath pekar på git-guard slutar git köra hooks i repots .git/hooks.
+# Det här skriptet kör repots egen hook med samma namn, så att t.ex. commit-msg,
+# pre-commit och git-lfs fungerar som vanligt. Behöver aldrig ändras.
+name="$(basename "$0")"
+dir="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+hook="$dir/hooks/$name"
+if [ -x "$hook" ] && ! [ "$hook" -ef "$0" ] && ! grep -q '^# git-guard passthrough hook' "$hook" 2>/dev/null; then
+  exec "$hook" "$@"
+fi
+# Ingen egen hook: git-lfs behöver post-checkout/post-commit/post-merge i repon som använder LFS
+case "$name" in
+  post-checkout|post-commit|post-merge)
+    if command -v git-lfs >/dev/null 2>&1 \
+       && git ls-files -z -- .gitattributes '*/.gitattributes' 2>/dev/null | xargs -0 grep -qs 'filter=lfs' 2>/dev/null; then
+      exec git lfs "$name" "$@"
+    fi
+    ;;
+esac
+exit 0

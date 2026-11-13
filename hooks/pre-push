@@ -114,6 +114,22 @@ run_repo_hooks() {
     repo_hook_ran=1
     printf '%s\n' "$input" | "$h" "$@" || return 1
   done
+  # Repo med git-lfs men utan egen pre-push-hook (t.ex. när core.hooksPath är global och
+  # git lfs install inte kunde lägga sin hook i .git/hooks): kör git lfs pre-push själv,
+  # annars når LFS-filerna aldrig servern.
+  if [ "${repo_hook_ran:-0}" != 1 ] && uses_lfs; then
+    if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then
+      record skip "git lfs pre-push" "torrkörning"
+    else
+      step "git lfs pre-push (repot använder LFS)"
+      repo_hook_ran=1; repo_hook_label="git lfs pre-push"
+      printf '%s\n' "$input" | git lfs pre-push "$@" || return 1
+    fi
+  fi
+}
+uses_lfs() {
+  command -v git-lfs >/dev/null 2>&1 || return 1
+  git ls-files -z -- .gitattributes '*/.gitattributes' 2>/dev/null | xargs -0 grep -qs 'filter=lfs' 2>/dev/null
 }
 
 if cfg_bool disable; then
@@ -416,9 +432,9 @@ fi
 # --- 9. Repots egna hooks ----------------------------------------------------
 step_t0=$SECONDS
 if run_repo_hooks "$@"; then
-  [ "${repo_hook_ran:-0}" = 1 ] && record ok "Repots egen hook"
+  [ "${repo_hook_ran:-0}" = 1 ] && record ok "${repo_hook_label:-Repots egen hook}"
 else
-  fail=1; record fail "Repots egen hook"
+  fail=1; record fail "${repo_hook_label:-Repots egen hook}"
 fi
 
 # --- Spara grönt resultat för cachen ---------------------------------------------
