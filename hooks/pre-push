@@ -85,6 +85,12 @@ run_repo_hooks() {
     [ -x "$h" ] || continue
     [ "$h" -ef "$0" ] && continue
     grep -q '^# git-guard pre-push hook' "$h" 2>/dev/null && continue
+    # Torrkörning (gg): repots hook kan ha sidoeffekter, t.ex. git lfs pre-push som laddar upp filer
+    if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then
+      yellow "Repots egen hook $(basename "$h") körs inte vid torrkörning (gg) – den körs vid git push"
+      record skip "Repots egen hook" "torrkörning"
+      continue
+    fi
     step "Kör repots egen hook: $(basename "$h")"
     repo_hook_ran=1
     printf '%s\n' "$input" | "$h" "$@" || return 1

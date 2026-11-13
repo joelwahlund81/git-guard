@@ -84,7 +84,7 @@ Varje fel följs av en rad `Rätta: ...` med kommandot som löser det.
 
 | Kommando | Gör |
 |---|---|
-| `gg` | Kör alla kontroller utan att pusha |
+| `gg` | Kör alla kontroller utan att pusha. Repots egna hooks (t.ex. git lfs) körs inte |
 | `ggnet` | Kör bara .NET-kontrollerna på hela repot |
 | `guard` | Slå av/på git-guard i aktuellt repo |
 | `aliases` | Visa alla egna kommandon |
@@ -132,7 +132,7 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 .\install-githooks.ps1 -Path C:\src -WhatIf         # visa vad som skulle hända
 .\install-githooks.ps1 -Global -Uninstall           # koppla bort globalt
 .\install-githooks.ps1 -Path C:\src -Uninstall      # ta bort ur repon
-.\install-terminal.ps1 -Theme paradox               # byt Oh My Posh-tema
+.\install-terminal.ps1 -Theme paradox               # byt Oh My Posh-tema (annars behålls ditt tema)
 ```
 
 Installeras hooken per repo döps en befintlig `pre-push` om till `pre-push.local` och körs ändå.

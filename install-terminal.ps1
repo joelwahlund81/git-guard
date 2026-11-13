@@ -10,6 +10,7 @@
       -SkipApps     Installera inte program via winget (Oh My Posh, PowerShell 7)
       -SkipFont     Installera inte Nerd Font och ändra inte Windows Terminal
       -Theme <namn> Oh My Posh-tema (standard: atomic). Se https://ohmyposh.dev/docs/themes
+                    Ett befintligt terminal/theme.omp.json skrivs bara över om -Theme anges.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -73,11 +74,17 @@ if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) { Write-Good "Oh My Po
 
 $themeFile = Join-Path $GGHome 'terminal/theme.omp.json'
 $themeUrl = "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/$Theme.omp.json"
-if ($PSCmdlet.ShouldProcess($themeFile, "Hämta tema '$Theme'")) {
+if ((Test-Path -LiteralPath $themeFile) -and -not $PSBoundParameters.ContainsKey('Theme')) {
+    Write-Good 'Behåller ditt tema (terminal/theme.omp.json). Byt med: .\install-terminal.ps1 -Theme <namn>'
+} elseif ($PSCmdlet.ShouldProcess($themeFile, "Hämta tema '$Theme'")) {
     try {
-        Invoke-WebRequest -Uri $themeUrl -OutFile $themeFile -UseBasicParsing
+        # Ladda ned till en tempfil först så att en avbruten nedladdning inte förstör temat
+        $tmpTheme = "$themeFile.download"
+        Invoke-WebRequest -Uri $themeUrl -OutFile $tmpTheme -UseBasicParsing
+        Move-Item -LiteralPath $tmpTheme -Destination $themeFile -Force
         Write-Good "Tema: $Theme"
     } catch {
+        Remove-Item -LiteralPath "$themeFile.download" -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $themeFile) { Write-Note "Kunde inte hämta '$Theme' - behåller befintligt tema" }
         else { Write-Note "Kunde inte hämta tema '$Theme' - Oh My Posh standardtema används" }
     }

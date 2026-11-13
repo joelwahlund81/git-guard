@@ -87,6 +87,21 @@ function Install-Package {
     }
 }
 
+# pip install --user lägger programmet i Pythons användarmapp (Scripts), som ofta saknas i PATH.
+# Då hittar hooken inte programmet. Visa i så fall exakt vad som ska läggas till.
+function Test-UserScriptsInPath([string]$Py, [string]$Tool) {
+    $ErrorActionPreference = 'Continue'
+    $scripts = (& $Py -c "import os, sysconfig; print(sysconfig.get_path('scripts', os.name + '_user'))" 2>$null | Select-Object -First 1)
+    if (-not $scripts) { return }
+    $scripts = $scripts.Trim()
+    $inPath = @($env:Path -split [IO.Path]::PathSeparator | Where-Object { $_.TrimEnd('\', '/') -eq $scripts.TrimEnd('\', '/') }).Count -gt 0
+    if (-not $inPath -and -not (Get-Command $Tool -ErrorAction SilentlyContinue)) {
+        Write-Note "$Tool installerades i $scripts, men den mappen finns inte i PATH."
+        Write-Note "Rätta: lägg till mappen i PATH (Inställningar > System > Om > Avancerade systeminställningar > Miljövariabler),"
+        Write-Note "       eller installera pipx (py -m pip install --user pipx; py -m pipx ensurepath) och kör -InstallTools igen."
+    }
+}
+
 function Install-Tools {
     Write-Info "`nInstallerar verktyg"
     $hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
@@ -105,8 +120,12 @@ function Install-Tools {
     }
     if (-not (Get-Command sqlfluff -ErrorAction SilentlyContinue)) {
         $py = @('py', 'python', 'python3') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-        if ($py -and $PSCmdlet.ShouldProcess('sqlfluff', 'pip install')) {
+        if ((Get-Command pipx -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess('sqlfluff', 'pipx install')) {
+            # pipx lägger programmet i en mapp som redan finns i PATH (pipx ensurepath)
+            pipx install sqlfluff
+        } elseif ($py -and $PSCmdlet.ShouldProcess('sqlfluff', 'pip install')) {
             & $py -m pip install --user --upgrade sqlfluff
+            Test-UserScriptsInPath $py 'sqlfluff'
         } elseif ($hasWinget) {
             Write-Note 'Python saknas. Kör: winget install -e --id Python.Python.3.12   och sedan skriptet igen'
         } else { Write-Note 'Installera Python och kör: pip install sqlfluff' }

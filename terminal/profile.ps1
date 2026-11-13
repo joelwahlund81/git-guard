@@ -92,7 +92,12 @@ $MyCommands = [ordered]@{
 $myExtra = Join-Path $GGHome 'terminal/my-commands.ps1'
 if (Test-Path -LiteralPath $myExtra) { . $myExtra }
 
-foreach ($k in $MyCommands.Keys) { Set-Item "function:global:$k" $MyCommands[$k].Cmd }
+# Inbyggda alias (t.ex. gp = Get-ItemProperty, gl = Get-Location) går före funktioner och
+# måste tas bort först, annars körs aliaset i stället för kommandot.
+foreach ($k in $MyCommands.Keys) {
+    if (Test-Path -LiteralPath "Alias:$k") { Remove-Item -LiteralPath "Alias:$k" -Force -ErrorAction SilentlyContinue }
+    Set-Item "function:global:$k" $MyCommands[$k].Cmd
+}
 
 function aliases {
     Write-Host "`n  Mina kommandon" -ForegroundColor Cyan
