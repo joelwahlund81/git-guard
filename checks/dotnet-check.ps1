@@ -20,6 +20,10 @@
       6. dotnet test
 
     -Detailed visar varje dotnet-kommando och hela utdatan.
+
+    -ExistingIssues warn: problem i projektfiler som pushen inte rör (de fanns redan) blir
+    varningar i stället för fel. Hooken skickar gitguard.existingIssues (standard warn).
+    Körs skriptet manuellt (ggnet) räknas allt som fel, som tidigare.
 #>
 [CmdletBinding()]
 param(
@@ -30,6 +34,8 @@ param(
     [switch]$SkipTests,
     [switch]$SkipFormat,
     [switch]$SkipBuild,
+    [ValidateSet('error', 'warn')]
+    [string]$ExistingIssues = 'error',
     # Visa varje dotnet-kommando och hela utdatan (gitguard.verbose / GITGUARD_VERBOSE=1)
     [switch]$Detailed
 )
@@ -165,6 +171,38 @@ if ($ChangedFilesPath -and (Test-Path -LiteralPath $ChangedFilesPath)) {
     $changed = @(Get-Content -LiteralPath $ChangedFilesPath | Where-Object { $_ } | ForEach-Object { $_ -replace '\\', '/' })
 }
 
+# --- Nya eller gamla problem? ------------------------------------------------
+# Ett problem räknas som nytt om pushen ändrar någon av filerna det gäller (projektet,
+# dess packages.config/packages.lock.json) eller en fil som påverkar alla projekt.
+$changedSet = @{}
+foreach ($c in $changed) { $changedSet[$c.ToLower()] = $true }
+$sharedTouched = @($changed | Where-Object {
+    $_ -match '(^|/)(directory\.(build|packages)\.(props|targets)|global\.json|nuget\.config)$' }).Count -gt 0
+$script:OldIssues = 0
+
+function Test-Touched([string[]]$Sources) {
+    if (-not $ChangedFilesPath -or $ExistingIssues -eq 'error' -or $sharedTouched) { return $true }
+    foreach ($src in $Sources) {
+        if (-not $src) { continue }
+        $f = ($src -replace ' \(packages\.config\)$', '').ToLower()
+        $dir = if ($f.Contains('/')) { $f.Substring(0, $f.LastIndexOf('/') + 1) } else { '' }
+        foreach ($cand in @($f, "${dir}packages.lock.json", "${dir}packages.config")) {
+            if ($changedSet.ContainsKey($cand)) { return $true }
+        }
+    }
+    return $false
+}
+
+# Write-RefIssue: som Write-Issue, men ett fel i filer som pushen inte rör blir en varning
+function Write-RefIssue([string]$Level, [string[]]$Sources, [string]$m) {
+    if ($Level -eq 'error' -and -not (Test-Touched $Sources)) {
+        $script:OldIssues++
+        if ($m.EndsWith(':')) { Write-Warn2 ($m.TrimEnd(':') + ' (fanns redan):') } else { Write-Warn2 "$m (fanns redan)" }
+    } else {
+        Write-Issue $Level $m
+    }
+}
+
 # =============================================================================
 # 1. Projektfiler
 # =============================================================================
@@ -212,14 +250,18 @@ foreach ($p in $refFiles) {
         $cond = (($cond -join '&') -replace '\s+', '').ToLower()
 
         if ($projCpm) {
-            if ($ver) { Write-Bad "$rel`: $id har Version='$ver' men Central Package Management används - flytta versionen till Directory.Packages.props" }
+            if ($ver) {
+                Write-RefIssue 'error' @($rel) "$rel`: $id har Version='$ver' men Central Package Management används"
+                Write-Detail "Rätta: ta bort Version= här och lägg <PackageVersion Include=`"$id`" Version=`"$ver`" /> i Directory.Packages.props"
+            }
             if ($override) {
                 Write-Warn2 "$rel`: $id använder VersionOverride='$override' (avviker från central version)"
                 $ver = $override
             } elseif ($centralVersions.ContainsKey($id.ToLower())) {
                 $ver = $centralVersions[$id.ToLower()]
             } elseif (-not $ver) {
-                Write-Bad "$rel`: $id saknar PackageVersion i Directory.Packages.props"
+                Write-RefIssue 'error' @($rel) "$rel`: $id saknar PackageVersion i Directory.Packages.props"
+                Write-Detail "Rätta: lägg till <PackageVersion Include=`"$id`" Version=`"<version>`" /> i Directory.Packages.props"
             }
         }
         if ($ver -match '\*|^[\[\(]') { Write-Warn2 "$rel`: $id har flytande/intervall-version '$ver' - lås till en exakt version" }
@@ -237,7 +279,10 @@ foreach ($p in $refFiles) {
         $full = $hint
         if ($hint -notmatch '\$\(') {
             $full = [IO.Path]::GetFullPath((Join-Path (Split-Path $p.FullName -Parent) ($hint -replace '[\\/]', [IO.Path]::DirectorySeparatorChar)))
-            if (-not (Test-Path -LiteralPath $full)) { Write-Bad "$rel`: DLL saknas: $hint" }
+            if (-not (Test-Path -LiteralPath $full)) {
+                Write-RefIssue 'error' @($rel) "$rel`: DLL saknas: $hint"
+                Write-Detail 'Rätta: committa DLL:en, rätta HintPath eller byt till ett NuGet-paket'
+            }
         }
         $dllRefs.Add([pscustomobject]@{ Name = $name; Version = $ver; HintPath = $hint; FullPath = $full.ToLower(); RealPath = $full; Source = $rel })
         if ($hint -match '(^|[\\/])packages[\\/]') {
@@ -261,10 +306,11 @@ $drift = @($pkgRefs | Where-Object { $_.Id -and $_.Version } | Group-Object { "$
     Where-Object { @($_.Group | Select-Object -ExpandProperty Version -Unique).Count -gt 1 })
 foreach ($g in $drift) {
     $first = $g.Group[0].Id
-    Write-Issue $DriftLevel "NuGet-paketet $first finns i olika versioner:"
+    Write-RefIssue $DriftLevel @($g.Group | ForEach-Object { $_.Source }) "NuGet-paketet $first finns i olika versioner:"
     foreach ($vg in ($g.Group | Group-Object Version | Sort-Object Name)) {
         Write-Detail ("{0,-14} {1}" -f $vg.Name, (($vg.Group | Select-Object -ExpandProperty Source -Unique) -join ', '))
     }
+    Write-Detail 'Rätta: använd samma Version överallt (eller Central Package Management, se README)'
 }
 
 # 1b. Samma bibliotek som både DLL och NuGet
@@ -279,9 +325,10 @@ foreach ($d in $dllRefs) {
     # Det är NuGet som refererar den, inte en extra DLL.
     if ($hit -and $d.HintPath -match ('(^|[\\/])packages[\\/]' + [regex]::Escape($hit.Id) + '\.\d')) { $hit = $null }
     if ($hit) {
-        Write-Bad "$($d.Name) refereras både som DLL och som NuGet-paket:"
+        Write-RefIssue 'error' @($d.Source, $hit.Source) "$($d.Name) refereras både som DLL och som NuGet-paket:"
         Write-Detail "DLL:   $($d.Source) -> $($d.HintPath)"
         Write-Detail "NuGet: $($hit.Source) -> $($hit.Id) $($hit.Version)"
+        Write-Detail "Rätta: ta bort <Reference Include=`"$($d.Name)`"> i $($d.Source) och använd NuGet-paketet"
     }
 }
 
@@ -305,7 +352,7 @@ foreach ($g in ($dllRefs | Group-Object { $_.Name.ToLower() })) {
     $versions  = @($g.Group | Where-Object { $_.EffVersion } | ForEach-Object { $_.EffVersion } | Select-Object -Unique)
     $locations = @($g.Group | ForEach-Object { Get-DllLocation $_ } | Select-Object -Unique)
     if ($versions.Count -gt 1) {
-        Write-Bad "DLL:en $($g.Group[0].Name) refereras i olika versioner:"
+        Write-RefIssue 'error' @($g.Group | ForEach-Object { $_.Source }) "DLL:en $($g.Group[0].Name) refereras i olika versioner:"
     } elseif ($locations.Count -gt 1) {
         Write-Warn2 "DLL:en $($g.Group[0].Name) refereras från olika mappar (samma eller okänd version):"
     } else { continue }
@@ -365,7 +412,7 @@ if ($lockFiles.Count -gt 0) {
 if ($restoreOk) {
     Write-Step 'Analyserar transitiva beroenden'
     $errorCodes = @('NU1605', 'NU1107', 'NU1903', 'NU1904', 'NU1106')
-    $logSeen = @{}
+    $logSeen = [ordered]@{}   # kod|paket|meddelande -> @{ Log; Projects; Sources }
     $resolved = @{}   # "tfm|id" -> @{ version -> [projekt] }
     $issuesBefore = $script:ErrorCount + $script:WarnCount
 
@@ -379,12 +426,11 @@ if ($restoreOk) {
         foreach ($log in @($json.logs)) {
             if (-not $log) { continue }
             $key = "$($log.code)|$($log.libraryId)|$($log.message)"
-            if ($logSeen.ContainsKey($key)) { continue }
-            $logSeen[$key] = $true
-            $level = if ($errorCodes -contains $log.code -or $log.level -eq 'Error') { 'error' } else { 'warn' }
-            $what = Get-NuLabel $log.code
-            Write-Issue $level "$what ($($log.code)) i ${projName}:"
-            Write-Detail ($log.message -replace '\s+', ' ')
+            if (-not $logSeen.Contains($key)) {
+                $logSeen[$key] = @{ Log = $log; Projects = New-Object System.Collections.Generic.List[string]; Sources = New-Object System.Collections.Generic.List[string] }
+            }
+            $logSeen[$key].Projects.Add($projName)
+            $logSeen[$key].Sources.Add((Get-Rel $p.FullName))
         }
 
         foreach ($tfm in @($json.targets.PSObject.Properties)) {
@@ -398,6 +444,17 @@ if ($restoreOk) {
                 $vers[$parts[1]].Add($projName)
             }
         }
+    }
+
+    foreach ($entry in $logSeen.Values) {
+        $log = $entry.Log
+        $level = if ($errorCodes -contains $log.code -or $log.level -eq 'Error') { 'error' } else { 'warn' }
+        $what = Get-NuLabel $log.code
+        Write-RefIssue $level @($entry.Sources) "$what ($($log.code)) i $(($entry.Projects | Select-Object -Unique) -join ', '):"
+        Write-Detail ($log.message -replace '\s+', ' ')
+        if ($log.code -match 'NU190[1-4]') { Write-Detail "Rätta: uppdatera paketet $($log.libraryId) till en version utan sårbarheten (dotnet list package --vulnerable --include-transitive)" }
+        elseif ($log.code -eq 'NU1605') { Write-Detail 'Rätta: höj den direkta PackageReference till den version som beroendet kräver' }
+        elseif ($log.code -eq 'NU1107') { Write-Detail 'Rätta: lägg till en direkt PackageReference med en version som passar alla beroenden' }
     }
 
     $transDrift = @($resolved.Values | Where-Object { $_.Versions.Count -gt 1 } | Sort-Object Id)
@@ -467,7 +524,9 @@ if (-not $SkipBuild -and $restoreOk) {
                 'MSB3243' { 'Olöslig referenskonflikt'; break }
                 default   { 'Inkompatibel referens' }
             }
-            Write-Bad $label
+            $src = @()
+            if ($i -match '\[([^\[\]]+\.(csproj|fsproj|vbproj))\]\s*$') { $src = @(Get-Rel $Matches[1]) }
+            Write-RefIssue 'error' $src $label
             Write-Detail ($i -replace '^.*?warning ', '')
         }
         if ($code -ne 0) {
@@ -504,6 +563,10 @@ if (-not $SkipTests) {
 }
 
 # =============================================================================
+if ($script:OldIssues -gt 0) {
+    Write-Detail "$($script:OldIssues) problem markerade (fanns redan) gäller filer som pushen inte ändrar och stoppar inte pushen."
+    Write-Detail 'Vill du att de stoppar: git config gitguard.existingIssues error'
+}
 $secs = [int]((Get-Date) - $started).TotalSeconds
 if ($script:ErrorCount -gt 0) {
     Write-Host "$E[31m.NET: $script:ErrorCount fel, $script:WarnCount varningar (${secs}s)$E[0m"

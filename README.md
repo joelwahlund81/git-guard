@@ -44,7 +44,7 @@ Hooken går igenom stegen i ordning. Ett **✗** stoppar pushen, ett **!** är b
 | 0 | Skyddade brancher | Blockerar direkt push till brancher i `gitguard.protectedBranches` | ✗ |
 | 1 | Ändrade filer | Tar fram filerna i commits som inte finns på remoten än. Resten av stegen tittar bara på dem | – |
 | 2 | Konfliktmarkörer | Letar efter kvarglömda `<<<<<<<` / `>>>>>>>` | ✗ |
-| 3 | SQL | `sqlfluff lint` på ändrade `.sql`-filer (T-SQL som standard) | ✗ |
+| 3 | SQL | `sqlfluff lint` på ändrade `.sql`-filer (T-SQL som standard). Stoppar bara om repot har en `.sqlfluff`, annars varning | ✗ / ! |
 | 4 | Hemligheter | `gitleaks` på de commits som pushas: lösenord, nycklar, tokens. Hittar även hemligheter som tagits bort i en senare commit. Fynden visas maskerade, och repots `.gitleaks.toml`/`.gitleaksignore` gäller | ✗ |
 | 5 | npm-låsfil | `package.json` ändrad men inte `package-lock.json` | ! |
 | 6 | .NET | Kör `checks/dotnet-check.ps1`, se nedan | ✗ |
@@ -75,6 +75,12 @@ eller `git config gitguard.verbose true`.
 | 6.6 | Test | `dotnet test` om testprojekt finns | ✗ |
 
 \* Blir en varning med `git config gitguard.versionDrift warn`.
+
+**Gamla problem stoppar inte.** Ett ✗ i projektfiler (6.1, 6.3 och referenskonflikter i 6.5) stoppar
+bara om pushen ändrar något av de berörda projekten, deras `packages.config`/`packages.lock.json`
+eller en gemensam fil (`Directory.*.props/targets`, `global.json`, `nuget.config`). Annars blir det en
+varning markerad **(fanns redan)**, så att du inte blockeras av skuld som någon annan lämnat.
+Vill du ha det strängare: `git config gitguard.existingIssues error`. `ggnet` räknar alltid allt som fel.
 
 Varje fel följs av en rad `Rätta: ...` med kommandot som löser det.
 
@@ -118,6 +124,8 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.skipDotnet` | `true` | Hoppa över alla .NET-steg |
 | `gitguard.skipFormat` | `true` | Hoppa över `dotnet format` |
 | `gitguard.versionDrift` | `warn` | Versionsdrift varnar i stället för att stoppa |
+| `gitguard.existingIssues` | `warn` (standard) / `error` | Problem i .NET-filer som pushen inte rör varnar med "(fanns redan)" i stället för att stoppa |
+| `gitguard.sqlLint` | `error` / `warn` / `off` | Hur SQL-lint ska räknas. Standard: `error` om repot har `.sqlfluff`, annars `warn` |
 | `gitguard.sqlDialect` | `postgres` m.fl. | Annan SQL-dialekt (en `.sqlfluff` i repot vinner) |
 | `gitguard.protectedBranches` | `"main master"` | Blockera direkt push till de brancherna |
 | `gitguard.verbose` | `true` | Visa vilka filer som ingår, varje kommando och full dotnet-utdata |

@@ -10,6 +10,10 @@
 #   gitguard.skipDotnet         true = hoppa över .NET-kontrollerna
 #   gitguard.skipFormat         true = hoppa över dotnet format
 #   gitguard.versionDrift       error (standard) | warn
+#   gitguard.existingIssues     warn (standard) | error – problem i .NET-filer som pushen
+#                               inte rör (de fanns redan) varnar i stället för att stoppa
+#   gitguard.sqlLint            error | warn | off – standard: error om repot har .sqlfluff,
+#                               annars warn
 #   gitguard.sqlDialect         tsql (standard) – ignoreras om repot har .sqlfluff
 #   gitguard.protectedBranches  t.ex. "main master" = blockera direkt push dit
 #   gitguard.verbose            true = visa filer, kommandon och full utdata
@@ -69,6 +73,14 @@ trap 'exit 130' INT TERM
 
 cfg()      { local v; v="$(git config --get "gitguard.$1" 2>/dev/null)"; printf '%s' "${v:-${2:-}}"; }
 cfg_bool() { [ "$(git config --bool --get "gitguard.$1" 2>/dev/null)" = "true" ]; }
+# cfg_enum <namn> <standard> <tillåtna...> – okända värden varnar och ger standardvärdet
+cfg_enum() {
+  local name="$1" def="$2" v a; shift 2
+  v="$(cfg "$name" "$def")"
+  for a in "$@"; do [ "$v" = "$a" ] && { printf '%s' "$v"; return 0; }; done
+  yellow "Okänt värde gitguard.$name='$v' (tillåtet: $*) – använder $def" >&2
+  printf '%s' "$def"
+}
 # Git Bash på Windows: gör om /c/... till C:\... innan sökvägar skickas till PowerShell
 to_native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 
@@ -167,7 +179,13 @@ sql_files=()
 for f in "${files[@]+"${files[@]}"}"; do
   case "$f" in *.sql|*.SQL) sql_files+=("$f") ;; esac
 done
-if [ ${#sql_files[@]} -gt 0 ]; then
+# Utan .sqlfluff har teamet inte valt regler: då varnar lint bara (gitguard.sqlLint ändrar det)
+sql_level="$(cfg sqlLint)"
+case "$sql_level" in ""|error|warn|off) ;; *) yellow "Okänt värde gitguard.sqlLint='$sql_level' (tillåtet: error warn off)"; sql_level="" ;; esac
+if [ -z "$sql_level" ]; then if [ -f .sqlfluff ]; then sql_level=error; else sql_level=warn; fi; fi
+if [ ${#sql_files[@]} -gt 0 ] && [ "$sql_level" = off ]; then
+  record skip "SQL" "gitguard.sqlLint off"
+elif [ ${#sql_files[@]} -gt 0 ]; then
   begin "SQL-lint: ${#sql_files[@]} fil(er)"
   if command -v sqlfluff >/dev/null 2>&1; then
     dialect_arg=()
@@ -175,10 +193,14 @@ if [ ${#sql_files[@]} -gt 0 ]; then
     vcmd sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"
     if sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"; then
       green "SQL ok"; record ok "SQL"
-    else
+    elif [ "$sql_level" = error ]; then
       red "SQL-lint misslyckades"; fail=1
       hint "sqlfluff fix <fil>   (rättar det mesta automatiskt)"
       record fail "SQL"
+    else
+      yellow "SQL-lint hittade avvikelser (varning – repot har ingen .sqlfluff)"
+      hint "sqlfluff fix <fil>, eller lägg en .sqlfluff i repot så att teamets regler gäller och stoppar"
+      record warn "SQL"
     fi
   else
     yellow "sqlfluff saknas – hoppar över SQL"
@@ -274,7 +296,8 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; the
     list="$(mktemp)"
     printf '%s\n' "${files[@]+"${files[@]}"}" > "$list"
     ps_args=(-RepoRoot "$(to_native "$PWD")" -ChangedFilesPath "$(to_native "$list")"
-             -DriftLevel "$(cfg versionDrift error)")
+             -DriftLevel "$(cfg_enum versionDrift error error warn)"
+             -ExistingIssues "$(cfg_enum existingIssues warn warn error)")
     [ "${SKIP_TESTS:-0}" = 1 ] && ps_args+=(-SkipTests)
     cfg_bool skipFormat && ps_args+=(-SkipFormat)
     [ "$verbose" -eq 1 ] && ps_args+=(-Detailed)
