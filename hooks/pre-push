@@ -26,6 +26,8 @@ red()    { printf '\033[31m✗ %s\033[0m\n' "$*"; }
 green()  { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m! %s\033[0m\n' "$*"; }
 step()   { printf '\033[36m▸ %s\033[0m\n' "$*"; }
+detail() { printf '\033[90m    %s\033[0m\n' "$*"; }
+hint()   { printf '\033[90m    Rätta: %s\033[0m\n' "$*"; }
 
 cfg()      { local v; v="$(git config --get "gitguard.$1" 2>/dev/null)"; printf '%s' "${v:-${2:-}}"; }
 cfg_bool() { [ "$(git config --bool --get "gitguard.$1" 2>/dev/null)" = "true" ]; }
@@ -75,9 +77,11 @@ fi
 
 # --- 1. Vilka filer ingår i pushen? -----------------------------------------
 files=()
+push_shas=""
 while read -r _ lsha _ _; do
   [ -z "${lsha:-}" ] && continue
   [ "$lsha" = "$ZERO" ] && continue                    # branch tas bort
+  push_shas="$push_shas $lsha"
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] && files+=("$f")
   done < <(git log --name-only --pretty=format: --diff-filter=ACMR \
@@ -125,17 +129,33 @@ if [ ${#sql_files[@]} -gt 0 ]; then
 fi
 
 # --- 4. Hemligheter ----------------------------------------------------------
-if [ ${#files[@]} -gt 0 ] && command -v gitleaks >/dev/null 2>&1; then
-  step "Söker efter hemligheter"
-  tmp="$(mktemp -d)"
-  for f in "${files[@]}"; do mkdir -p "$tmp/$(dirname "$f")"; cp "$f" "$tmp/$f"; done
-  if gitleaks dir "$tmp" --no-banner >/dev/null 2>&1 \
-     || gitleaks detect --no-git --source "$tmp" --no-banner >/dev/null 2>&1; then
-    green "Inga hemligheter"
+# Söker i de commits som pushas (git log), inte i arbetskatalogen. Då hittas även en
+# hemlighet som lagts till i en commit och tagits bort i en senare - den följer ändå med.
+# Körs i repots rot så att .gitleaks.toml och .gitleaksignore gäller. --redact maskerar fynden.
+if [ -n "$push_shas" ]; then
+  if command -v gitleaks >/dev/null 2>&1; then
+    step "Söker efter hemligheter i commits som pushas"
+    # shellcheck disable=SC2086  # push_shas är medvetet en lista
+    log_opts="$(printf '%s ' $push_shas)--not --remotes=$remote"
+    if gitleaks git --help >/dev/null 2>&1; then
+      leaks_out="$(gitleaks git --no-banner --redact -v --exit-code 42 --log-opts="$log_opts" . 2>&1)"; rc=$?
+    else
+      leaks_out="$(gitleaks detect --no-banner --redact -v --exit-code 42 --source . --log-opts="$log_opts" 2>&1)"; rc=$?
+    fi
+    if [ $rc -eq 0 ]; then
+      green "Inga hemligheter"
+    elif [ $rc -eq 42 ]; then
+      printf '%s\n' "$leaks_out" | sed 's/^/    /'
+      red "gitleaks hittade möjliga hemligheter i commits som ska pushas (maskerade ovan)"; fail=1
+      hint "ta bort hemligheten ur commiten (git commit --amend, eller git rebase -i <commit>^) och byt nyckeln. Falsklarm: lägg fingeravtrycket i .gitleaksignore"
+    else
+      printf '%s\n' "$leaks_out" | tail -n 5 | sed 's/^/    /'
+      yellow "gitleaks kunde inte köras (se ovan) – hemligheter kontrollerades inte"
+    fi
   else
-    red "gitleaks hittade möjliga hemligheter (kör: gitleaks dir . för detaljer)"; fail=1
+    yellow "gitleaks saknas – hemligheter kontrolleras inte"
+    hint "winget install Gitleaks.Gitleaks   (eller .\\install-githooks.ps1 -InstallTools)"
   fi
-  rm -rf "$tmp"
 fi
 
 # --- 5. Låsfiler (npm) -------------------------------------------------------

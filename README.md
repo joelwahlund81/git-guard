@@ -45,7 +45,7 @@ Hooken går igenom stegen i ordning. Ett **✗** stoppar pushen, ett **!** är b
 | 1 | Ändrade filer | Tar fram filerna i commits som inte finns på remoten än. Resten av stegen tittar bara på dem | – |
 | 2 | Konfliktmarkörer | Letar efter kvarglömda `<<<<<<<` / `>>>>>>>` | ✗ |
 | 3 | SQL | `sqlfluff lint` på ändrade `.sql`-filer (T-SQL som standard) | ✗ |
-| 4 | Hemligheter | `gitleaks` på ändrade filer: lösenord, nycklar, tokens | ✗ |
+| 4 | Hemligheter | `gitleaks` på de commits som pushas: lösenord, nycklar, tokens. Hittar även hemligheter som tagits bort i en senare commit. Fynden visas maskerade, och repots `.gitleaks.toml`/`.gitleaksignore` gäller | ✗ |
 | 5 | npm-låsfil | `package.json` ändrad men inte `package-lock.json` | ! |
 | 6 | .NET | Kör `checks/dotnet-check.ps1`, se nedan | ✗ |
 | 7 | Tester | `npm test`, `pytest` eller `go test` om sådana projekt finns | ✗ |
