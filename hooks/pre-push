@@ -181,6 +181,32 @@ else
   green "Inga ändrade filer att kontrollera"
 fi
 
+# --- Är arbetskatalogen samma sak som det som pushas? -----------------------
+# Konfliktmarkörer, SQL, format, build och tester läser filerna på disk. Skiljer de sig
+# från det som pushas kan kontrollerna ge fel svar åt båda hållen.
+step_t0=$SECONDS
+head_sha="$(git rev-parse HEAD 2>/dev/null)"
+other_commit=0
+while read -r lref lsha _ _; do
+  [ -z "${lsha:-}" ] || [ "$lsha" = "$ZERO" ] && continue
+  case "$lref" in refs/tags/*) continue ;; esac
+  [ "$lsha" != "$head_sha" ] && other_commit=1
+done <<< "$input"
+dirty=""
+if [ ${#files[@]} -gt 0 ]; then
+  dirty="$(git status --porcelain -- "${files[@]}" 2>/dev/null | head -n 5)"
+fi
+if [ $other_commit -eq 1 ]; then
+  yellow "Du pushar en annan commit än den du står på (HEAD) – kontrollerna läser arbetskatalogen och kan ge fel svar"
+  hint "byt till branchen och pusha därifrån:  git switch <branch> && git push"
+  record warn "Arbetskatalog" "pushar inte HEAD"
+elif [ -n "$dirty" ]; then
+  yellow "Ocommittade ändringar i filer som pushas – kontrollerna ser dina lokala ändringar, inte det som pushas:"
+  printf '%s\n' "$dirty" | sed 's/^/    /'
+  hint "committa ändringarna, eller lägg undan dem medan du pushar:  git stash && git push && git stash pop"
+  record warn "Arbetskatalog" "ocommittade ändringar"
+fi
+
 has_file() {  # has_file <glob> – finns någon ändrad fil som matchar?
   local f; for f in "${files[@]+"${files[@]}"}"; do case "$f" in $1) return 0 ;; esac; done; return 1
 }
