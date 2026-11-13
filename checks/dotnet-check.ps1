@@ -1,0 +1,458 @@
+﻿<#
+.SYNOPSIS
+    git-guard: .NET-kontroller som körs från pre-push-hooken.
+
+.DESCRIPTION
+    Körs automatiskt av hooken - behöver aldrig ändras. Fungerar i PowerShell 7 (pwsh)
+    och Windows PowerShell 5.1. Kan också köras manuellt i ett repo:
+
+        pwsh ~/.git-guard/checks/dotnet-check.ps1 -RepoRoot .
+
+    Kontroller:
+      1. Projektfiler: samma NuGet-paket i olika versioner, DLL-referens + NuGet för
+         samma bibliotek, olika DLL-versioner/sökvägar, saknade DLL:er, flytande
+         versioner, packages.config, Central Package Management-regler
+      2. dotnet restore (--locked-mode om packages.lock.json finns)
+      3. Transitiva beroenden (tredjepartsbibliotek) via obj/project.assets.json:
+         nedgraderingar, versionskonflikter, sårbara paket, olika upplösta versioner
+      4. dotnet format på ändrade filer
+      5. dotnet build: referenskonflikter (MSB3277), olösta referenser (MSB3245)
+      6. dotnet test
+#>
+[CmdletBinding()]
+param(
+    [string]$RepoRoot = '.',
+    [string]$ChangedFilesPath,
+    [ValidateSet('error', 'warn')]
+    [string]$DriftLevel = 'error',
+    [switch]$SkipTests,
+    [switch]$SkipFormat,
+    [switch]$SkipBuild
+)
+
+# 'Continue': Windows PowerShell 5.1 avbryter annars när dotnet skriver till stderr
+$ErrorActionPreference = 'Continue'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+if ($PSVersionTable.PSVersion.Major -ge 7 -and (Get-Variable PSStyle -ErrorAction SilentlyContinue)) {
+    $PSStyle.OutputRendering = 'Ansi'
+}
+Set-Location -LiteralPath $RepoRoot -ErrorAction Stop
+$script:RootPrefix = (Get-Location).Path.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+$env:DOTNET_NOLOGO = '1'
+
+# --- Utskrift ----------------------------------------------------------------
+$E = [char]27
+$script:ErrorCount = 0
+$script:WarnCount = 0
+function Write-Step([string]$m) { Write-Host "$E[36m▸ $m$E[0m" }
+function Write-Ok([string]$m)   { Write-Host "$E[32m✓ $m$E[0m" }
+function Write-Bad([string]$m)  { $script:ErrorCount++; Write-Host "$E[31m✗ $m$E[0m" }
+function Write-Warn2([string]$m){ $script:WarnCount++;  Write-Host "$E[33m! $m$E[0m" }
+function Write-Detail([string]$m) {
+    if ($script:RootPrefix) { $m = $m.Replace($script:RootPrefix, '').Replace(($script:RootPrefix -replace '\\', '/'), '') }
+    $m = $m -replace '\s*\[[^\[\]]+\.(csproj|fsproj|vbproj|sln|slnx)\]\s*$', ''
+    Write-Host "$E[90m    $m$E[0m"
+}
+function Write-Issue([string]$Level, [string]$m) {
+    if ($Level -eq 'error') { Write-Bad $m } else { Write-Warn2 $m }
+}
+$started = Get-Date
+
+function Get-NuLabel([string]$Code) {
+    switch -Regex ($Code) {
+        'NU1605' { return 'Nedgradering av paket (ett beroende kräver en högre version)' }
+        'NU1608' { return 'Paketversion utanför beroendets tillåtna intervall' }
+        'NU1107' { return 'Versionskonflikt mellan beroenden' }
+        'NU1603' { return 'Beroende löstes till en högre version än begärt' }
+        'NU1701' { return 'Paket för .NET Framework används i ett modernt projekt' }
+        'NU190[1-4]' { return 'Sårbart paket' }
+        'NU1004' { return 'packages.lock.json är i osynk' }
+        'NU1101|NU1102|NU1103' { return 'Paket eller version hittades inte' }
+        'NU1301' { return 'Kunde inte nå paketkällan' }
+        default { return 'NuGet' }
+    }
+}
+
+# --- Hjälpfunktioner ---------------------------------------------------------
+$ExcludeRx = '[\\/](bin|obj|node_modules|\.git|\.vs|TestResults)[\\/]|[\\/]packages[\\/][^\\/]+\.\d+\.\d+'
+
+function Get-RepoFile([string[]]$Include) {
+    Get-ChildItem -Path . -Recurse -File -Include $Include -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch $ExcludeRx }
+}
+
+function Get-Rel([string]$Path) {
+    $root = (Get-Location).Path.TrimEnd('\', '/')
+    if ($Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        return $Path.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
+    }
+    return $Path -replace '\\', '/'
+}
+
+function Read-Xml([string]$Path) {
+    try { return [xml](Get-Content -LiteralPath $Path -Raw) }
+    catch { Write-Warn2 "Kunde inte läsa XML: $(Get-Rel $Path)"; return $null }
+}
+
+function Get-Nodes($Xml, [string]$Name) {
+    if (-not $Xml) { return @() }
+    return @($Xml.SelectNodes("//*[local-name()='$Name']"))
+}
+
+function Get-AttrOrChild($Node, [string]$Name) {
+    $v = $Node.GetAttribute($Name)
+    if ($v) { return $v.Trim() }
+    $child = $Node.SelectSingleNode("*[local-name()='$Name']")
+    if ($child) { return $child.InnerText.Trim() }
+    return ''
+}
+
+# Enkla MSBuild-egenskaper ($(Name)) från Directory.*.props och projektet självt
+$GlobalProps = @{}
+function Add-Props($Xml, [hashtable]$Target) {
+    foreach ($pg in (Get-Nodes $Xml 'PropertyGroup')) {
+        foreach ($p in $pg.ChildNodes) {
+            if ($p.NodeType -eq 'Element' -and -not $p.HasAttribute('Condition')) { $Target[$p.LocalName] = $p.InnerText.Trim() }
+        }
+    }
+}
+function Expand-Props([string]$Value, [hashtable]$Local) {
+    if ($Value -notmatch '\$\(') { return $Value }
+    return [regex]::Replace($Value, '\$\(([^)]+)\)', {
+        param($m)
+        $k = $m.Groups[1].Value
+        if ($Local.ContainsKey($k)) { return $Local[$k] }
+        if ($GlobalProps.ContainsKey($k)) { return $GlobalProps[$k] }
+        return $m.Value
+    })
+}
+
+# --- Hitta projekt och mål ---------------------------------------------------
+$projects = @(Get-RepoFile @('*.csproj', '*.fsproj', '*.vbproj'))
+if ($projects.Count -eq 0) { Write-Ok 'Inga .NET-projekt'; exit 0 }
+
+$solutions = @(Get-ChildItem -Path (Join-Path (Get-Location).Path '*') -File -Include '*.sln', '*.slnx' -Force -ErrorAction SilentlyContinue)
+if ($solutions.Count -eq 0) {
+    $solutions = @(Get-ChildItem -Path . -File -Recurse -Depth 2 -Include '*.sln', '*.slnx' -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch $ExcludeRx })
+}
+if ($solutions.Count -gt 0) {
+    $targets = @($solutions[0].FullName)
+    if ($solutions.Count -gt 1) { Write-Detail "Flera solutions hittades, använder $(Get-Rel $solutions[0].FullName)" }
+} else {
+    $targets = @($projects | ForEach-Object { $_.FullName })
+}
+Write-Step ".NET: $($projects.Count) projekt ($((($targets | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')))"
+
+$changed = @()
+if ($ChangedFilesPath -and (Test-Path -LiteralPath $ChangedFilesPath)) {
+    $changed = @(Get-Content -LiteralPath $ChangedFilesPath | Where-Object { $_ } | ForEach-Object { $_ -replace '\\', '/' })
+}
+
+# =============================================================================
+# 1. Projektfiler
+# =============================================================================
+Write-Step 'Analyserar paket- och DLL-referenser'
+
+$packageProps = @(Get-RepoFile @('Directory.Packages.props'))
+$buildProps   = @(Get-RepoFile @('Directory.Build.props', 'Directory.Build.targets'))
+$cpmEnabled = $false
+$centralVersions = @{}   # id -> version
+foreach ($f in @($buildProps + $packageProps)) {
+    $x = Read-Xml $f.FullName
+    Add-Props $x $GlobalProps
+}
+foreach ($f in $packageProps) {
+    $x = Read-Xml $f.FullName
+    foreach ($n in (Get-Nodes $x 'ManagePackageVersionsCentrally')) { if ($n.InnerText.Trim() -eq 'true') { $cpmEnabled = $true } }
+    foreach ($n in (Get-Nodes $x 'PackageVersion')) {
+        $id = $n.GetAttribute('Include')
+        if ($id) { $centralVersions[$id.ToLower()] = Expand-Props (Get-AttrOrChild $n 'Version') @{} }
+    }
+}
+if ($GlobalProps['ManagePackageVersionsCentrally'] -eq 'true') { $cpmEnabled = $true }
+
+$pkgRefs = New-Object System.Collections.Generic.List[object]   # Id, Version, Source, Kind
+$dllRefs = New-Object System.Collections.Generic.List[object]   # Name, Version, HintPath, Source
+
+$refFiles = @($projects) + @($buildProps)
+foreach ($p in $refFiles) {
+    $x = Read-Xml $p.FullName
+    if (-not $x) { continue }
+    $rel = Get-Rel $p.FullName
+    $local = @{}; Add-Props $x $local
+
+    foreach ($n in (Get-Nodes $x 'PackageReference')) {
+        $id = $n.GetAttribute('Include')
+        if (-not $id) { continue }          # Update= räknas inte
+        $ver      = Expand-Props (Get-AttrOrChild $n 'Version') $local
+        $override = Expand-Props (Get-AttrOrChild $n 'VersionOverride') $local
+
+        if ($cpmEnabled) {
+            if ($ver) { Write-Bad "$rel`: $id har Version='$ver' men Central Package Management används - flytta versionen till Directory.Packages.props" }
+            if ($override) {
+                Write-Warn2 "$rel`: $id använder VersionOverride='$override' (avviker från central version)"
+                $ver = $override
+            } elseif ($centralVersions.ContainsKey($id.ToLower())) {
+                $ver = $centralVersions[$id.ToLower()]
+            } elseif (-not $ver) {
+                Write-Bad "$rel`: $id saknar PackageVersion i Directory.Packages.props"
+            }
+        }
+        if ($ver -match '\*|^[\[\(]') { Write-Warn2 "$rel`: $id har flytande/intervall-version '$ver' - lås till en exakt version" }
+        $pkgRefs.Add([pscustomobject]@{ Id = $id; Version = $ver; Source = $rel; Kind = 'PackageReference' })
+    }
+
+    foreach ($n in (Get-Nodes $x 'Reference')) {
+        $inc = $n.GetAttribute('Include')
+        $hint = Get-AttrOrChild $n 'HintPath'
+        if (-not $inc -or -not $hint) { continue }   # ramverksreferenser utan HintPath ignoreras
+        $name = ($inc -split ',')[0].Trim()
+        $ver = ''
+        if ($inc -match 'Version=([^,\s]+)') { $ver = $Matches[1] }
+        $hint = Expand-Props $hint $local
+        $full = $hint
+        if ($hint -notmatch '\$\(') {
+            $full = [IO.Path]::GetFullPath((Join-Path (Split-Path $p.FullName -Parent) ($hint -replace '[\\/]', [IO.Path]::DirectorySeparatorChar)))
+            if (-not (Test-Path -LiteralPath $full)) { Write-Bad "$rel`: DLL saknas: $hint" }
+        }
+        $dllRefs.Add([pscustomobject]@{ Name = $name; Version = $ver; HintPath = $hint; FullPath = $full.ToLower(); Source = $rel })
+        if ($hint -match '(^|[\\/])packages[\\/]') {
+            Write-Warn2 "$rel`: $name refereras via packages\-mappen (gammal packages.config-stil) - byt till PackageReference"
+        }
+    }
+
+    $pc = Join-Path (Split-Path $p.FullName -Parent) 'packages.config'
+    if ($p.Extension -ne '.props' -and $p.Extension -ne '.targets' -and (Test-Path -LiteralPath $pc)) {
+        Write-Warn2 "$rel`: använder packages.config - migrera till PackageReference (Visual Studio: högerklicka packages.config > Migrate)"
+        $pcx = Read-Xml $pc
+        foreach ($n in (Get-Nodes $pcx 'package')) {
+            $pkgRefs.Add([pscustomobject]@{ Id = $n.GetAttribute('id'); Version = $n.GetAttribute('version'); Source = "$rel (packages.config)"; Kind = 'packages.config' })
+        }
+    }
+}
+
+# 1a. Samma paket i olika versioner
+$drift = @($pkgRefs | Where-Object { $_.Id -and $_.Version } | Group-Object { $_.Id.ToLower() } |
+    Where-Object { @($_.Group | Select-Object -ExpandProperty Version -Unique).Count -gt 1 })
+foreach ($g in $drift) {
+    $first = $g.Group[0].Id
+    Write-Issue $DriftLevel "NuGet-paketet $first finns i olika versioner:"
+    foreach ($vg in ($g.Group | Group-Object Version | Sort-Object Name)) {
+        Write-Detail ("{0,-14} {1}" -f $vg.Name, (($vg.Group | Select-Object -ExpandProperty Source -Unique) -join ', '))
+    }
+}
+
+# 1b. Samma bibliotek som både DLL och NuGet
+$pkgIds = @{}
+foreach ($r in $pkgRefs) { if ($r.Id) { $pkgIds[$r.Id.ToLower()] = $r } }
+foreach ($d in $dllRefs) {
+    $key = $d.Name.ToLower()
+    $file = [IO.Path]::GetFileNameWithoutExtension(($d.HintPath -replace '\\', '/')).ToLower()
+    $hit = $null
+    if ($pkgIds.ContainsKey($key)) { $hit = $pkgIds[$key] } elseif ($pkgIds.ContainsKey($file)) { $hit = $pkgIds[$file] }
+    if ($hit) {
+        Write-Bad "$($d.Name) refereras både som DLL och som NuGet-paket:"
+        Write-Detail "DLL:   $($d.Source) -> $($d.HintPath)"
+        Write-Detail "NuGet: $($hit.Source) -> $($hit.Id) $($hit.Version)"
+    }
+}
+
+# 1c. Samma DLL med olika versioner eller sökvägar
+foreach ($g in ($dllRefs | Group-Object { $_.Name.ToLower() })) {
+    $variants = @($g.Group | ForEach-Object { "$($_.Version)|$($_.FullPath)" } | Select-Object -Unique)
+    if ($variants.Count -gt 1) {
+        Write-Bad "DLL:en $($g.Group[0].Name) refereras med olika versioner/sökvägar:"
+        foreach ($r in $g.Group) { Write-Detail ("{0,-12} {1} ({2})" -f $(if ($r.Version) { $r.Version } else { '?' }), $r.HintPath, $r.Source) }
+    }
+}
+
+if ($pkgRefs.Count -gt 0 -and -not $cpmEnabled -and $projects.Count -ge 3 -and $drift.Count -gt 0) {
+    Write-Detail 'Tips: Central Package Management (Directory.Packages.props) gör att versioner bara anges på ett ställe.'
+}
+if ($script:ErrorCount -eq 0 -and $script:WarnCount -eq 0) {
+    Write-Ok "Referenser ok ($($pkgRefs.Count) paket, $($dllRefs.Count) DLL-referenser)"
+}
+
+# =============================================================================
+# 2. Restore
+# =============================================================================
+$lockFiles = @(Get-RepoFile @('packages.lock.json'))
+$restoreOk = $true
+foreach ($t in $targets) {
+    $dnArgs = @('restore', $t, '--nologo', '-v', 'q')
+    if ($lockFiles.Count -gt 0) { $dnArgs += '--locked-mode' }
+    Write-Step ("dotnet restore" + $(if ($lockFiles.Count -gt 0) { ' --locked-mode' } else { '' }))
+    $out = & dotnet @dnArgs 2>&1 | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -ne 0) {
+        $restoreOk = $false
+        if ($lockFiles.Count -gt 0 -and ($out -match 'NU1004')) {
+            Write-Bad 'packages.lock.json är i osynk med projektfilerna'
+            Write-Detail 'Rätta: dotnet restore --force-evaluate   och committa packages.lock.json'
+        } else {
+            $codes = @($out | ForEach-Object { if ($_ -match 'error (NU\d{4})') { $Matches[1] } } | Select-Object -Unique)
+            if ($codes.Count -gt 0) {
+                foreach ($c in $codes) { Write-Bad "$(Get-NuLabel $c) ($c)" }
+            } else {
+                Write-Bad "dotnet restore misslyckades för $(Split-Path $t -Leaf)"
+            }
+        }
+        $out | Where-Object { $_ -match 'error' } |
+            ForEach-Object { ($_ -replace '^.*?error (NU\d{4}: )?', '' -replace 'Warning As Error: ', '').Trim() } |
+            Select-Object -Unique -First 15 | ForEach-Object { Write-Detail $_ }
+    }
+}
+if ($restoreOk) { Write-Ok 'Restore ok' }
+
+# Projekt som saknar låsfil när andra har det
+if ($lockFiles.Count -gt 0) {
+    foreach ($p in $projects) {
+        if (-not (Test-Path -LiteralPath (Join-Path $p.DirectoryName 'packages.lock.json'))) {
+            Write-Warn2 "$(Get-Rel $p.FullName) saknar packages.lock.json (sätt RestorePackagesWithLockFile i Directory.Build.props)"
+        }
+    }
+}
+
+# =============================================================================
+# 3. Transitiva beroenden (tredjepartsbibliotek)
+# =============================================================================
+if ($restoreOk) {
+    Write-Step 'Analyserar transitiva beroenden'
+    $errorCodes = @('NU1605', 'NU1107', 'NU1903', 'NU1904', 'NU1106')
+    $logSeen = @{}
+    $resolved = @{}   # "tfm|id" -> @{ version -> [projekt] }
+    $issuesBefore = $script:ErrorCount + $script:WarnCount
+
+    foreach ($p in $projects) {
+        $assets = Join-Path $p.DirectoryName 'obj/project.assets.json'
+        if (-not (Test-Path -LiteralPath $assets)) { continue }
+        try { $json = Get-Content -LiteralPath $assets -Raw | ConvertFrom-Json }
+        catch { Write-Warn2 "Kunde inte läsa $(Get-Rel $assets) (stora filer kräver pwsh 7)"; continue }
+        $projName = $p.BaseName
+
+        foreach ($log in @($json.logs)) {
+            if (-not $log) { continue }
+            $key = "$($log.code)|$($log.libraryId)|$($log.message)"
+            if ($logSeen.ContainsKey($key)) { continue }
+            $logSeen[$key] = $true
+            $level = if ($errorCodes -contains $log.code -or $log.level -eq 'Error') { 'error' } else { 'warn' }
+            $what = Get-NuLabel $log.code
+            Write-Issue $level "$what ($($log.code)) i ${projName}:"
+            Write-Detail ($log.message -replace '\s+', ' ')
+        }
+
+        foreach ($tfm in @($json.targets.PSObject.Properties)) {
+            foreach ($lib in @($tfm.Value.PSObject.Properties)) {
+                if ($lib.Value.type -ne 'package') { continue }
+                $parts = $lib.Name -split '/'
+                $k = "$($tfm.Name)|$($parts[0].ToLower())"
+                if (-not $resolved.ContainsKey($k)) { $resolved[$k] = @{ Id = $parts[0]; Tfm = $tfm.Name; Versions = @{} } }
+                $vers = $resolved[$k].Versions
+                if (-not $vers.ContainsKey($parts[1])) { $vers[$parts[1]] = New-Object System.Collections.Generic.List[string] }
+                $vers[$parts[1]].Add($projName)
+            }
+        }
+    }
+
+    $transDrift = @($resolved.Values | Where-Object { $_.Versions.Count -gt 1 } | Sort-Object Id)
+    if ($transDrift.Count -gt 0) {
+        Write-Warn2 "$($transDrift.Count) tredjepartspaket löses till olika versioner i olika projekt:"
+        foreach ($d in ($transDrift | Select-Object -First 12)) {
+            $desc = ($d.Versions.Keys | Sort-Object | ForEach-Object { "$_ ($(($d.Versions[$_] | Select-Object -Unique) -join ', '))" }) -join '  vs  '
+            Write-Detail "$($d.Id) [$($d.Tfm)]: $desc"
+        }
+        if ($transDrift.Count -gt 12) { Write-Detail "... och $($transDrift.Count - 12) till" }
+        Write-Detail 'Rätta: lägg till en direkt PackageReference (eller PackageVersion) med samma version överallt.'
+    }
+    if (($script:ErrorCount + $script:WarnCount) -eq $issuesBefore) { Write-Ok 'Transitiva beroenden ok' }
+}
+
+# =============================================================================
+# 4. Formatering (bara ändrade filer)
+# =============================================================================
+$codeFiles = @($changed | Where-Object { $_ -match '\.(cs|vb|fs)$' -and (Test-Path -LiteralPath $_) })
+if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
+    $hasEditorConfig = (Test-Path -LiteralPath '.editorconfig')
+    $mode = if ($hasEditorConfig) { 'style + whitespace (.editorconfig)' } else { 'whitespace' }
+    Write-Step "dotnet format: $($codeFiles.Count) fil(er), $mode"
+    $fmtOk = $true
+    foreach ($t in $targets) {
+        $dnArgs = @('format', $t)
+        if (-not $hasEditorConfig) { $dnArgs += 'whitespace' }
+        $dnArgs += @('--verify-no-changes', '--no-restore', '-v', 'q', '--include') + $codeFiles
+        $out = & dotnet @dnArgs 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -ne 0) {
+            $fmtOk = $false
+            Write-Bad 'Formateringen avviker'
+            $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First 10 | ForEach-Object { Write-Detail $_.Trim() }
+            Write-Detail ('Rätta: dotnet format' + $(if (-not $hasEditorConfig) { ' whitespace' } else { '' }) + ' och committa')
+        }
+    }
+    if ($fmtOk) { Write-Ok 'Formatering ok' }
+}
+
+# =============================================================================
+# 5. Build - referenskonflikter
+# =============================================================================
+$buildOk = $false
+$allRefIssues = 0
+if (-not $SkipBuild -and $restoreOk) {
+    Write-Step 'dotnet build'
+    $buildOk = $true
+    foreach ($t in $targets) {
+        $out = & dotnet build $t --no-restore --nologo -v q '-clp:NoSummary' 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+        $refIssues = @($out | Where-Object { $_ -match 'warning (MSB3277|MSB3245|MSB3243|MSB3274|MSB3275)' } |
+            ForEach-Object { ($_).Trim() } | Select-Object -Unique)
+        $allRefIssues += $refIssues.Count
+        foreach ($i in $refIssues) {
+            $label = switch -Regex ($i) {
+                'MSB3277' { 'Referenskonflikt: olika versioner av samma assembly'; break }
+                'MSB3245' { 'Referens kunde inte hittas'; break }
+                'MSB3243' { 'Olöslig referenskonflikt'; break }
+                default   { 'Inkompatibel referens' }
+            }
+            Write-Bad $label
+            Write-Detail ($i -replace '^.*?warning ', '')
+        }
+        if ($code -ne 0) {
+            $buildOk = $false
+            Write-Bad "Bygget misslyckades: $(Split-Path $t -Leaf)"
+            $out | Where-Object { $_ -match ': error ' } | ForEach-Object { ($_).Trim() } |
+                Select-Object -Unique -First 15 | ForEach-Object { Write-Detail $_ }
+        }
+    }
+    if ($buildOk -and $allRefIssues -eq 0) { Write-Ok 'Build ok, inga referenskonflikter' }
+}
+
+# =============================================================================
+# 6. Tester
+# =============================================================================
+if (-not $SkipTests) {
+    $testProjects = @($projects | Where-Object {
+        $c = Get-Content -LiteralPath $_.FullName -Raw
+        $c -match 'Microsoft\.NET\.Test\.Sdk|<IsTestProject>\s*true' })
+    if ($testProjects.Count -eq 0) {
+        Write-Detail 'Inga testprojekt hittades'
+    } elseif (-not $restoreOk -or (-not $SkipBuild -and -not $buildOk)) {
+        Write-Warn2 'Hoppar över tester eftersom restore/build misslyckades'
+    } else {
+        Write-Step "dotnet test ($($testProjects.Count) testprojekt)"
+        foreach ($t in $targets) {
+            $dnArgs = @('test', $t, '--nologo', '-v', 'q')
+            if (-not $SkipBuild) { $dnArgs += '--no-build' } else { $dnArgs += '--no-restore' }
+            & dotnet @dnArgs 2>&1 | ForEach-Object { Write-Host "    $_" }
+            if ($LASTEXITCODE -ne 0) { Write-Bad 'Tester misslyckades' } else { Write-Ok 'Tester ok' }
+        }
+    }
+}
+
+# =============================================================================
+$secs = [int]((Get-Date) - $started).TotalSeconds
+if ($script:ErrorCount -gt 0) {
+    Write-Host "$E[31m.NET: $script:ErrorCount fel, $script:WarnCount varningar (${secs}s)$E[0m"
+    exit 1
+}
+Write-Host "$E[32m.NET: inga fel, $script:WarnCount varningar (${secs}s)$E[0m"
+exit 0

@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# git-guard pre-push hook
+# (raden ovan används av installationsskriptet för att känna igen hooken)
+#
+# Den här filen behöver aldrig ändras. Allt styrs med git config, globalt
+# (git config --global ...) eller per repo (git config ...). Se README.md.
+#
+#   gitguard.disable            true = stäng av alla kontroller
+#   gitguard.skipTests          true = kör inga tester
+#   gitguard.skipDotnet         true = hoppa över .NET-kontrollerna
+#   gitguard.skipFormat         true = hoppa över dotnet format
+#   gitguard.versionDrift       error (standard) | warn
+#   gitguard.sqlDialect         tsql (standard) – ignoreras om repot har .sqlfluff
+#   gitguard.protectedBranches  t.ex. "main master" = blockera direkt push dit
+#
+# Engångsundantag:  git push --no-verify   |   SKIP_TESTS=1 git push
+
+set -uo pipefail
+
+GG_HOME="${GIT_GUARD_HOME:-$HOME/.git-guard}"
+remote="${1:-origin}"
+ZERO=0000000000000000000000000000000000000000
+fail=0
+
+red()    { printf '\033[31m✗ %s\033[0m\n' "$*"; }
+green()  { printf '\033[32m✓ %s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m! %s\033[0m\n' "$*"; }
+step()   { printf '\033[36m▸ %s\033[0m\n' "$*"; }
+
+cfg()      { local v; v="$(git config --get "gitguard.$1" 2>/dev/null)"; printf '%s' "${v:-${2:-}}"; }
+cfg_bool() { [ "$(git config --bool --get "gitguard.$1" 2>/dev/null)" = "true" ]; }
+# Git Bash på Windows: gör om /c/... till C:\... innan sökvägar skickas till PowerShell
+to_native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Git skickar "<local ref> <local sha> <remote ref> <remote sha>" på stdin
+input="$(cat)"
+
+# --- Repots egna hooks (körs alltid sist) -----------------------------------
+repo_hooks="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks"
+run_repo_hooks() {
+  local h
+  for h in "$repo_hooks/pre-push" "$repo_hooks/pre-push.local"; do
+    [ -x "$h" ] || continue
+    [ "$h" -ef "$0" ] && continue
+    grep -q '^# git-guard pre-push hook' "$h" 2>/dev/null && continue
+    step "Kör repots egen hook: $(basename "$h")"
+    printf '%s\n' "$input" | "$h" "$@" || return 1
+  done
+}
+
+if cfg_bool disable; then
+  yellow "git-guard avstängd i detta repo (gitguard.disable)"
+  run_repo_hooks "$@"; exit $?
+fi
+cfg_bool skipTests && SKIP_TESTS=1
+
+printf '\033[1;36m── git-guard ──────────────────────────────\033[0m\n'
+
+# --- 0. Skyddade brancher ----------------------------------------------------
+protected="$(cfg protectedBranches)"
+if [ -n "$protected" ]; then
+  while read -r _ lsha rref _; do
+    [ -z "${rref:-}" ] && continue
+    [ "$lsha" = "$ZERO" ] && continue
+    for b in $protected; do
+      if [ "$rref" = "refs/heads/$b" ]; then
+        red "Direkt push till '$b' är blockerad (gitguard.protectedBranches). Gör en PR."
+        fail=1
+      fi
+    done
+  done <<< "$input"
+fi
+
+# --- 1. Vilka filer ingår i pushen? -----------------------------------------
+files=()
+while read -r _ lsha _ _; do
+  [ -z "${lsha:-}" ] && continue
+  [ "$lsha" = "$ZERO" ] && continue                    # branch tas bort
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] && files+=("$f")
+  done < <(git log --name-only --pretty=format: --diff-filter=ACMR \
+             "$lsha" --not --remotes="$remote" 2>/dev/null | sort -u)
+done <<< "$input"
+
+if [ ${#files[@]} -gt 0 ]; then
+  uniq_files=()
+  while IFS= read -r f; do uniq_files+=("$f"); done < <(printf '%s\n' "${files[@]}" | sort -u)
+  files=("${uniq_files[@]}")
+  step "${#files[@]} ändrade fil(er) i pushen"
+else
+  green "Inga ändrade filer att kontrollera"
+fi
+
+has_file() {  # has_file <glob> – finns någon ändrad fil som matchar?
+  local f; for f in "${files[@]+"${files[@]}"}"; do case "$f" in $1) return 0 ;; esac; done; return 1
+}
+
+# --- 2. Merge-konfliktmarkörer ----------------------------------------------
+if [ ${#files[@]} -gt 0 ]; then
+  if grep -nIE '^(<<<<<<<|>>>>>>>)( |$)' -- "${files[@]}" 2>/dev/null; then
+    red "Konfliktmarkörer hittade"; fail=1
+  fi
+fi
+
+# --- 3. SQL-lint (bara ändrade .sql-filer) ----------------------------------
+sql_files=()
+for f in "${files[@]+"${files[@]}"}"; do
+  case "$f" in *.sql|*.SQL) sql_files+=("$f") ;; esac
+done
+if [ ${#sql_files[@]} -gt 0 ]; then
+  step "SQL-lint: ${#sql_files[@]} fil(er)"
+  if command -v sqlfluff >/dev/null 2>&1; then
+    dialect_arg=()
+    [ -f .sqlfluff ] || dialect_arg=(--dialect "$(cfg sqlDialect tsql)")
+    if sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"; then
+      green "SQL ok"
+    else
+      red "SQL-lint misslyckades (sqlfluff fix <fil> kan rätta det mesta)"; fail=1
+    fi
+  else
+    yellow "sqlfluff saknas (pip install sqlfluff) – hoppar över SQL"
+  fi
+fi
+
+# --- 4. Hemligheter ----------------------------------------------------------
+if [ ${#files[@]} -gt 0 ] && command -v gitleaks >/dev/null 2>&1; then
+  step "Söker efter hemligheter"
+  tmp="$(mktemp -d)"
+  for f in "${files[@]}"; do mkdir -p "$tmp/$(dirname "$f")"; cp "$f" "$tmp/$f"; done
+  if gitleaks dir "$tmp" --no-banner >/dev/null 2>&1 \
+     || gitleaks detect --no-git --source "$tmp" --no-banner >/dev/null 2>&1; then
+    green "Inga hemligheter"
+  else
+    red "gitleaks hittade möjliga hemligheter (kör: gitleaks dir . för detaljer)"; fail=1
+  fi
+  rm -rf "$tmp"
+fi
+
+# --- 5. Låsfiler (npm) -------------------------------------------------------
+if has_file 'package.json' && [ -f package-lock.json ] && ! has_file 'package-lock.json'; then
+  yellow "package.json ändrad men inte package-lock.json – kör npm install och committa låsfilen om beroenden ändrats"
+fi
+
+# --- 6. Har kod ändrats? -----------------------------------------------------
+code_changed=0
+for f in "${files[@]+"${files[@]}"}"; do
+  case "$f" in *.md|*.txt|docs/*|*.png|*.jpg|*.jpeg|*.gif|*.svg) ;; *) code_changed=1 ;; esac
+done
+
+# --- 7. .NET (PowerShell-kontroller) ----------------------------------------
+dotnet_done=0
+is_dotnet=0
+if ls ./*.sln ./*.slnx >/dev/null 2>&1 || [ -n "$(find . -maxdepth 5 \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' \) \
+     -not -path '*/node_modules/*' -not -path '*/bin/*' -not -path '*/obj/*' -print -quit 2>/dev/null)" ]; then
+  is_dotnet=1
+fi
+
+cfg_bool skipDotnet && dotnet_done=1
+if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; then
+  ps_exe=""
+  for c in pwsh pwsh.exe powershell.exe powershell; do
+    command -v "$c" >/dev/null 2>&1 && { ps_exe="$c"; break; }
+  done
+  check_script="$GG_HOME/checks/dotnet-check.ps1"
+
+  if [ -z "$ps_exe" ]; then
+    yellow "PowerShell saknas – kör bara enkla .NET-tester (installera pwsh för fler kontroller)"
+  elif [ ! -f "$check_script" ]; then
+    yellow "Hittar inte $check_script – kör installationsskriptet igen"
+  elif ! command -v dotnet >/dev/null 2>&1; then
+    yellow "dotnet saknas i PATH – hoppar över .NET-kontroller"; dotnet_done=1
+  else
+    list="$(mktemp)"
+    printf '%s\n' "${files[@]+"${files[@]}"}" > "$list"
+    ps_args=(-RepoRoot "$(to_native "$PWD")" -ChangedFilesPath "$(to_native "$list")"
+             -DriftLevel "$(cfg versionDrift error)")
+    [ "${SKIP_TESTS:-0}" = 1 ] && ps_args+=(-SkipTests)
+    cfg_bool skipFormat && ps_args+=(-SkipFormat)
+    "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+      -File "$(to_native "$check_script")" "${ps_args[@]}" || fail=1
+    rm -f "$list"
+    dotnet_done=1
+  fi
+fi
+
+# --- 8. Tester (övriga språk + .NET-reserv) ---------------------------------
+if [ "${SKIP_TESTS:-0}" = 1 ]; then
+  yellow "Hoppar över tester (SKIP_TESTS / gitguard.skipTests)"
+elif [ $code_changed -eq 0 ]; then
+  [ ${#files[@]} -gt 0 ] && green "Bara dokumentation ändrad – hoppar över tester"
+else
+  if [ $is_dotnet -eq 1 ] && [ $dotnet_done -eq 0 ] && command -v dotnet >/dev/null 2>&1; then
+    step "dotnet test"
+    dotnet test --nologo -v q || { red "dotnet test misslyckades"; fail=1; }
+  fi
+  if [ -f package.json ] && grep -q '"test"[[:space:]]*:' package.json \
+     && ! grep -q 'no test specified' package.json; then
+    step "npm test"
+    npm test --silent || { red "npm test misslyckades"; fail=1; }
+  fi
+  if { [ -f pyproject.toml ] || [ -f pytest.ini ]; } && command -v pytest >/dev/null 2>&1; then
+    step "pytest"
+    pytest -q || { red "pytest misslyckades"; fail=1; }
+  fi
+  if [ -f go.mod ]; then
+    step "go test"
+    go test ./... || { red "go test misslyckades"; fail=1; }
+  fi
+fi
+
+# --- 9. Repots egna hooks ----------------------------------------------------
+run_repo_hooks "$@" || fail=1
+
+# -----------------------------------------------------------------------------
+if [ $fail -ne 0 ]; then
+  if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then red "Kontrollerna hittade fel (se ovan)"; else red "Push avbruten. Fixa felen ovan eller kör: git push --no-verify"; fi
+  exit 1
+fi
+if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then green "Alla kontroller ok (ingen push gjordes)"; else green "Alla kontroller ok – pushar"; fi
+exit 0

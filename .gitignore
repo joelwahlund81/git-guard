@@ -1,0 +1,15 @@
+# Personliga filer som skapas vid installation (ska inte in i repot)
+terminal/my-commands.ps1
+terminal/theme.omp.json
+
+# Backup och temporärt
+*.bak
+*.git-guard.bak
+
+# Testrepon och editorer
+.test/
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

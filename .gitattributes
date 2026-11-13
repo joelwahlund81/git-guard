@@ -1,0 +1,13 @@
+# Alla textfiler lagras med LF i repot
+* text=auto eol=lf
+
+# Hooken MÅSTE ha LF – bash i Git for Windows klarar inte CRLF
+hooks/* text eol=lf
+
+# PowerShell fungerar med både LF och CRLF; BOM bevaras av git
+*.ps1  text eol=lf
+*.psd1 text eol=lf
+*.psm1 text eol=lf
+
+*.md   text eol=lf
+*.json text eol=lf
