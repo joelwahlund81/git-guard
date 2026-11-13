@@ -98,7 +98,11 @@ Funktionstest, i ett testrepo med sln och 2–3 classlib-projekt:
 |---|---|
 | Samma paket med olika `Version` i två projekt | Fel: versionsdrift (+ NU1605 om de refererar varandra) |
 | `<Reference><HintPath>` till en DLL med samma namn som ett NuGet-paket | Fel: DLL + NuGet |
-| Samma DLL från två olika mappar/versioner | Fel: DLL-konflikt |
+| Samma DLL i två olika versioner | Fel: DLL-konflikt |
+| Samma DLL (samma version) från två olika mappar | Varning |
+| packages.config-projekt med `..\packages\Id.1.2.3\lib\...` | Bara varning om packages.config, inget DLL+NuGet-fel |
+| Olika versioner av ett paket i villkorade ItemGroups (per TFM) | Ingen drift |
+| Projekt med `ManagePackageVersionsCentrally=false` i ett CPM-repo | Inget CPM-fel |
 | `RestorePackagesWithLockFile` + ändrad version utan ny låsfil | Fel: låsfil i osynk (NU1004) |
 | Projekt A får paket X 2.0 transitivt, projekt B har X 1.0 direkt | Varning: transitiv drift |
 | Felaktiga mellanslag i ändrad `.cs` | Fel: formatering |

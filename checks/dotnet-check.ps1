@@ -182,14 +182,21 @@ foreach ($p in $refFiles) {
     if (-not $x) { continue }
     $rel = Get-Rel $p.FullName
     $local = @{}; Add-Props $x $local
+    # Ett projekt kan välja bort Central Package Management själv
+    $projCpm = $cpmEnabled
+    if ($local['ManagePackageVersionsCentrally'] -eq 'false') { $projCpm = $false }
+    elseif ($local['ManagePackageVersionsCentrally'] -eq 'true') { $projCpm = $true }
 
     foreach ($n in (Get-Nodes $x 'PackageReference')) {
         $id = $n.GetAttribute('Include')
         if (-not $id) { continue }          # Update= räknas inte
         $ver      = Expand-Props (Get-AttrOrChild $n 'Version') $local
         $override = Expand-Props (Get-AttrOrChild $n 'VersionOverride') $local
+        # Villkor (t.ex. per TargetFramework) från ItemGroup och själva referensen
+        $cond = @($n.ParentNode.GetAttribute('Condition'), $n.GetAttribute('Condition')) | Where-Object { $_ }
+        $cond = (($cond -join '&') -replace '\s+', '').ToLower()
 
-        if ($cpmEnabled) {
+        if ($projCpm) {
             if ($ver) { Write-Bad "$rel`: $id har Version='$ver' men Central Package Management används - flytta versionen till Directory.Packages.props" }
             if ($override) {
                 Write-Warn2 "$rel`: $id använder VersionOverride='$override' (avviker från central version)"
@@ -201,7 +208,7 @@ foreach ($p in $refFiles) {
             }
         }
         if ($ver -match '\*|^[\[\(]') { Write-Warn2 "$rel`: $id har flytande/intervall-version '$ver' - lås till en exakt version" }
-        $pkgRefs.Add([pscustomobject]@{ Id = $id; Version = $ver; Source = $rel; Kind = 'PackageReference' })
+        $pkgRefs.Add([pscustomobject]@{ Id = $id; Version = $ver; Source = $rel; Kind = 'PackageReference'; Condition = $cond })
     }
 
     foreach ($n in (Get-Nodes $x 'Reference')) {
@@ -217,7 +224,7 @@ foreach ($p in $refFiles) {
             $full = [IO.Path]::GetFullPath((Join-Path (Split-Path $p.FullName -Parent) ($hint -replace '[\\/]', [IO.Path]::DirectorySeparatorChar)))
             if (-not (Test-Path -LiteralPath $full)) { Write-Bad "$rel`: DLL saknas: $hint" }
         }
-        $dllRefs.Add([pscustomobject]@{ Name = $name; Version = $ver; HintPath = $hint; FullPath = $full.ToLower(); Source = $rel })
+        $dllRefs.Add([pscustomobject]@{ Name = $name; Version = $ver; HintPath = $hint; FullPath = $full.ToLower(); RealPath = $full; Source = $rel })
         if ($hint -match '(^|[\\/])packages[\\/]') {
             Write-Warn2 "$rel`: $name refereras via packages\-mappen (gammal packages.config-stil) - byt till PackageReference"
         }
@@ -228,13 +235,14 @@ foreach ($p in $refFiles) {
         Write-Warn2 "$rel`: använder packages.config - migrera till PackageReference (Visual Studio: högerklicka packages.config > Migrate)"
         $pcx = Read-Xml $pc
         foreach ($n in (Get-Nodes $pcx 'package')) {
-            $pkgRefs.Add([pscustomobject]@{ Id = $n.GetAttribute('id'); Version = $n.GetAttribute('version'); Source = "$rel (packages.config)"; Kind = 'packages.config' })
+            $pkgRefs.Add([pscustomobject]@{ Id = $n.GetAttribute('id'); Version = $n.GetAttribute('version'); Source = "$rel (packages.config)"; Kind = 'packages.config'; Condition = '' })
         }
     }
 }
 
-# 1a. Samma paket i olika versioner
-$drift = @($pkgRefs | Where-Object { $_.Id -and $_.Version } | Group-Object { $_.Id.ToLower() } |
+# 1a. Samma paket i olika versioner. Referenser med olika villkor (t.ex. en version per
+#     TargetFramework) jämförs inte med varandra - det är avsiktligt.
+$drift = @($pkgRefs | Where-Object { $_.Id -and $_.Version } | Group-Object { "$($_.Id.ToLower())|$($_.Condition)" } |
     Where-Object { @($_.Group | Select-Object -ExpandProperty Version -Unique).Count -gt 1 })
 foreach ($g in $drift) {
     $first = $g.Group[0].Id
@@ -252,6 +260,9 @@ foreach ($d in $dllRefs) {
     $file = [IO.Path]::GetFileNameWithoutExtension(($d.HintPath -replace '\\', '/')).ToLower()
     $hit = $null
     if ($pkgIds.ContainsKey($key)) { $hit = $pkgIds[$key] } elseif ($pkgIds.ContainsKey($file)) { $hit = $pkgIds[$file] }
+    # packages.config-stil: DLL:en ligger i paketets egen mapp (packages\Id.1.2.3\lib\...).
+    # Det är NuGet som refererar den, inte en extra DLL.
+    if ($hit -and $d.HintPath -match ('(^|[\\/])packages[\\/]' + [regex]::Escape($hit.Id) + '\.\d')) { $hit = $null }
     if ($hit) {
         Write-Bad "$($d.Name) refereras både som DLL och som NuGet-paket:"
         Write-Detail "DLL:   $($d.Source) -> $($d.HintPath)"
@@ -259,13 +270,32 @@ foreach ($d in $dllRefs) {
     }
 }
 
-# 1c. Samma DLL med olika versioner eller sökvägar
+# 1c. Samma DLL med olika versioner eller sökvägar.
+#     Fel när versionerna skiljer sig. Bara olika sökväg (t.ex. lib\net45 och lib\netstandard2.0
+#     i samma paket, eller en kopia med samma version) är en varning.
+function Get-DllVersion($Ref) {
+    if ($Ref.Version) { return $Ref.Version }
+    if ($Ref.HintPath -match '\$\(' -or -not (Test-Path -LiteralPath $Ref.RealPath)) { return '' }
+    try { return [Reflection.AssemblyName]::GetAssemblyName($Ref.RealPath).Version.ToString() }
+    catch { return '' }
+}
+function Get-DllLocation($Ref) {
+    # DLL:er i en NuGet-paketmapp räknas till paketmappen, inte till lib\<tfm>
+    if ($Ref.FullPath -match '^(.*[\\/]packages[\\/][^\\/]+)[\\/]') { return $Matches[1] }
+    return $Ref.FullPath
+}
 foreach ($g in ($dllRefs | Group-Object { $_.Name.ToLower() })) {
-    $variants = @($g.Group | ForEach-Object { "$($_.Version)|$($_.FullPath)" } | Select-Object -Unique)
-    if ($variants.Count -gt 1) {
-        Write-Bad "DLL:en $($g.Group[0].Name) refereras med olika versioner/sökvägar:"
-        foreach ($r in $g.Group) { Write-Detail ("{0,-12} {1} ({2})" -f $(if ($r.Version) { $r.Version } else { '?' }), $r.HintPath, $r.Source) }
-    }
+    if ($g.Count -lt 2) { continue }
+    foreach ($r in $g.Group) { $r | Add-Member -NotePropertyName EffVersion -NotePropertyValue (Get-DllVersion $r) -Force }
+    $versions  = @($g.Group | Where-Object { $_.EffVersion } | ForEach-Object { $_.EffVersion } | Select-Object -Unique)
+    $locations = @($g.Group | ForEach-Object { Get-DllLocation $_ } | Select-Object -Unique)
+    if ($versions.Count -gt 1) {
+        Write-Bad "DLL:en $($g.Group[0].Name) refereras i olika versioner:"
+    } elseif ($locations.Count -gt 1) {
+        Write-Warn2 "DLL:en $($g.Group[0].Name) refereras från olika mappar (samma eller okänd version):"
+    } else { continue }
+    foreach ($r in $g.Group) { Write-Detail ("{0,-12} {1} ({2})" -f $(if ($r.EffVersion) { $r.EffVersion } else { '?' }), $r.HintPath, $r.Source) }
+    Write-Detail 'Rätta: låt alla projekt peka på samma DLL (en gemensam lib-mapp) eller byt till ett NuGet-paket'
 }
 
 if ($pkgRefs.Count -gt 0 -and -not $cpmEnabled -and $projects.Count -ge 3 -and $drift.Count -gt 0) {

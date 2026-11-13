@@ -60,9 +60,9 @@ Saknas ett verktyg (sqlfluff, gitleaks, dotnet) hoppas steget över med en varni
 |---|---|---|---|
 | 6.1 | Projektfiler | Samma NuGet-paket i **olika versioner** i olika projekt | ✗ * |
 | | | Samma bibliotek både som **DLL** (`HintPath`) och som **NuGet-paket** | ✗ |
-| | | Samma DLL med olika versioner/sökvägar, eller en DLL som saknas | ✗ |
+| | | Samma DLL i **olika versioner**, eller en DLL som saknas | ✗ |
 | | | `Version=` i projekt trots Central Package Management, saknad `PackageVersion` | ✗ |
-| | | `packages.config`, DLL:er från `packages\`, flytande versioner (`1.*`), `VersionOverride` | ! |
+| | | `packages.config`, DLL:er från `packages\`, flytande versioner (`1.*`), `VersionOverride`, samma DLL från olika mappar | ! |
 | 6.2 | Restore | `dotnet restore`, med `--locked-mode` när `packages.lock.json` finns, så att låsfiler i osynk fångas | ✗ |
 | 6.3 | Tredjepartsbibliotek | Nedgraderingar (NU1605), versionskonflikter (NU1107), sårbara paket med hög/kritisk risk (NU1903/1904) | ✗ |
 | | | Utanför tillåtet intervall (NU1608), .NET Framework-paket (NU1701), sårbarheter med låg/medel risk | ! |
