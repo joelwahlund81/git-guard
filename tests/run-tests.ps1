@@ -362,6 +362,18 @@ $scenarios['skyddad branch'] = {
     Invoke-Git $r config gitguard.protectedBranches 'main master' | Out-Null
     Add-Commit $r @{ 'README.md' = "x`n" }
     Assert-Hook 'push till skyddad branch: fel' (Invoke-Hook $r) 1 @("Direkt push till 'main' är blockerad", 'Rätta:')
+    Invoke-Git $r config gitguard.protectedBranches 'release/* ma*' | Out-Null
+    Assert-Hook 'skyddad branch med jokertecken: fel' (Invoke-Hook $r) 1 @("Direkt push till 'main' är blockerad (gitguard.protectedBranches: ma*)")
+    Invoke-Git $r config gitguard.protectedBranches 'release/*' | Out-Null
+    Assert-Hook 'branch som inte matchar jokertecknet: ok' (Invoke-Hook $r) 0 @() @('blockerad')
+}
+
+$scenarios['utf-16 sql'] = {
+    $r = New-TestRepo 'utf16' @{}
+    New-Item -ItemType Directory -Path (Join-Path $r 'db') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $r 'db/q.sql'), "SELECT 1;`n", [Text.Encoding]::Unicode)
+    Invoke-Git $r add -A | Out-Null; Invoke-Git $r commit -qm utf16 | Out-Null
+    Assert-Hook 'UTF-16-kodad .sql: varning' (Invoke-Hook $r) 0 @('är sparad som UTF-16', 'Rätta: spara filen som UTF-8')
 }
 
 $scenarios['konfliktmarkörer'] = {

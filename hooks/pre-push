@@ -23,7 +23,7 @@
 #   gitguard.solution           sökväg till .sln/.slnx när repot har flera
 #   gitguard.testFilter         filter till dotnet test, t.ex. "Category!=Integration"
 #   gitguard.testTimeout        t.ex. "5m" = avbryt tester som hänger (--blame-hang-timeout)
-#   gitguard.protectedBranches  t.ex. "main master" = blockera direkt push dit
+#   gitguard.protectedBranches  t.ex. "main master release/*" = blockera direkt push dit
 #   gitguard.verbose            true = visa filer, kommandon och full utdata
 #
 # Engångsundantag:  git push --no-verify   |   SKIP_TESTS=1 git push
@@ -150,13 +150,19 @@ if [ -n "$protected" ]; then
   while read -r _ lsha rref _; do
     [ -z "${rref:-}" ] && continue
     [ "$lsha" = "$ZERO" ] && continue
+    case "$rref" in refs/heads/*) ;; *) continue ;; esac
+    branch="${rref#refs/heads/}"
+    set -f   # jokertecken som release/* ska jämföras med branchnamnet, inte med filer
     for b in $protected; do
-      if [ "$rref" = "refs/heads/$b" ]; then
-        red "Direkt push till '$b' är blockerad (gitguard.protectedBranches)"
-        hint "pusha till en egen branch och skapa en PR:  git switch -c <ny-branch> && git push -u $remote HEAD"
-        fail=1; prot_fail=1
-      fi
+      # shellcheck disable=SC2254  # $b får innehålla jokertecken
+      case "$branch" in
+        $b)
+          red "Direkt push till '$branch' är blockerad (gitguard.protectedBranches: $b)"
+          hint "pusha till en egen branch och skapa en PR:  git switch -c <ny-branch> && git push -u $remote HEAD"
+          fail=1; prot_fail=1 ;;
+      esac
     done
+    set +f
   done <<< "$input"
   if [ "${prot_fail:-0}" = 1 ]; then record fail "Skyddade brancher"; else record ok "Skyddade brancher"; fi
 fi
@@ -217,7 +223,10 @@ has_file() {  # has_file <glob> – finns någon ändrad fil som matchar?
 # --- 2. Merge-konfliktmarkörer ----------------------------------------------
 if [ ${#files[@]} -gt 0 ]; then
   step_t0=$SECONDS
-  if grep -nIE '^(<<<<<<<|>>>>>>>)( |$)' -- "${files[@]}" 2>/dev/null; then
+  # xargs delar upp långa fillistor (t.ex. första pushen av ett stort repo)
+  conflicts="$(printf '%s\0' "${files[@]}" | xargs -0 grep -nHIE '^(<<<<<<<|>>>>>>>)( |$)' -- 2>/dev/null)"
+  if [ -n "$conflicts" ]; then
+    printf '%s\n' "$conflicts" | sed 's/^/    /'
     red "Konfliktmarkörer hittade"; fail=1
     hint "lös konflikten i filerna ovan, ta bort markörerna och gör en ny commit"
     record fail "Konfliktmarkörer"
@@ -230,6 +239,16 @@ fi
 sql_files=()
 for f in "${files[@]+"${files[@]}"}"; do
   case "$f" in *.sql|*.SQL) sql_files+=("$f") ;; esac
+done
+# SSMS sparar ibland som UTF-16. Då kan varken sqlfluff eller sökningen efter
+# konfliktmarkörer läsa filen.
+for f in "${sql_files[@]+"${sql_files[@]}"}"; do
+  case "$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')" in
+    fffe|feff)
+      yellow "$f är sparad som UTF-16 – sqlfluff och sökningen efter konfliktmarkörer kan inte läsa den"
+      hint "spara filen som UTF-8 (SSMS: Arkiv > Spara som > pilen vid Spara > Spara med kodning)"
+      record warn "SQL-kodning" "$f" ;;
+  esac
 done
 # Utan .sqlfluff har teamet inte valt regler: då varnar lint bara (gitguard.sqlLint ändrar det)
 sql_level="$(cfg sqlLint)"

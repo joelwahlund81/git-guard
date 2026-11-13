@@ -18,7 +18,7 @@ $global:GGSettings = @(
     @{ Key = 'solution';          Default = '(första)';     Values = 'src/App.sln';              Desc = 'Vilken solution som byggs när repot har flera' }
     @{ Key = 'testFilter';        Default = '(inget)';      Values = '"Category!=Integration"';  Desc = 'Filter till dotnet test' }
     @{ Key = 'testTimeout';       Default = '(ingen)';      Values = '5m';                       Desc = 'Avbryt tester som hänger' }
-    @{ Key = 'protectedBranches'; Default = '(inga)';       Values = '"main master"';            Desc = 'Blockera direkt push till de här brancherna' }
+    @{ Key = 'protectedBranches'; Default = '(inga)';       Values = '"main release/*"';         Desc = 'Blockera direkt push till de här brancherna (jokertecken går bra)' }
     @{ Key = 'cache';             Default = 'true';         Values = 'false';                    Desc = 'Kör inte om .NET/tester för innehåll som redan är grönt' }
     @{ Key = 'verbose';           Default = 'false';        Values = 'true';                     Desc = 'Visa filer, kommandon och full utdata' }
     @{ Key = 'startup';           Default = 'full/short';   Values = 'full|short|off';           Desc = 'Startmeddelande: full i Windows Terminal, annars en rad' }

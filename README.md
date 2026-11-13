@@ -192,7 +192,7 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.testFilter` | `"Category!=Integration"` | Filter till `dotnet test`, t.ex. för att hoppa över tester som kräver databas eller Azure |
 | `gitguard.testTimeout` | `5m` | Avbryt tester som hänger (`--blame-hang-timeout`) i stället för att pushen fastnar |
 | `gitguard.sqlDialect` | `postgres` m.fl. | Annan SQL-dialekt (en `.sqlfluff` i repot vinner) |
-| `gitguard.protectedBranches` | `"main master"` | Blockera direkt push till de brancherna |
+| `gitguard.protectedBranches` | `"main master release/*"` | Blockera direkt push till de brancherna (jokertecken går bra) |
 | `gitguard.verbose` | `true` | Visa vilka filer som ingår, varje kommando och full dotnet-utdata |
 | `gitguard.startup` | `full` / `short` / `off` | Startmeddelandet i terminalen (standard: `full` i Windows Terminal, annars `short`) |
 | `gitguard.repoRoots` | `"C:\src;C:\jobb"` | Mappar där `repo` letar efter repon (global, standard `~/source/repos;~/src`) |
