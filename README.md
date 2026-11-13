@@ -51,8 +51,11 @@ Hooken går igenom stegen i ordning. Ett **✗** stoppar pushen, ett **!** är b
 | 7 | Tester | `npm test`, `pytest` eller `go test` om sådana projekt finns | ✗ |
 | 8 | Repots egen hook | Kör repots egen `pre-push` / `pre-push.local` om den finns | ✗ |
 
-Ändras bara dokumentation (`.md`, `.txt`, bilder) hoppas steg 6–7 över.
-Saknas ett verktyg (sqlfluff, gitleaks, dotnet) hoppas steget över med en varning.
+Ändras bara dokumentation (`.md`, `.txt`, bilder, mappen `docs/`) hoppas steg 6–7 över.
+Saknas ett verktyg (sqlfluff, gitleaks, dotnet, npm, pytest, go) hoppas steget över med en varning.
+Varje steg som hoppas över säger varför, och sist kommer en **sammanfattning** med en rad per steg
+och hur lång tid det tog. Vill du se exakt vad som körs: `GITGUARD_VERBOSE=1 git push` (en gång)
+eller `git config gitguard.verbose true`.
 
 ### .NET-stegen (`checks/dotnet-check.ps1`)
 
@@ -90,7 +93,9 @@ Varje fel följs av en rad `Rätta: ...` med kommandot som löser det.
 | `gco` / `gclean` | Byt branch / ta bort lokala brancher som är borta på remote |
 | `dt` / `azs` | `dotnet test` / aktiv Azure-subscription |
 
-Undantag för en enskild push: `git push --no-verify` (allt) eller `$env:SKIP_TESTS=1; git push` (tester).
+Undantag för en enskild push: `git push --no-verify` (allt) eller
+`$env:SKIP_TESTS=1; git push; Remove-Item Env:SKIP_TESTS` (tester). Glöm inte den sista delen:
+annars gäller `SKIP_TESTS` för alla pushar tills terminalen stängs.
 
 **Egna kommandon:** skapa `~/.git-guard/terminal/my-commands.ps1`. Filen ignoreras av git och
 skrivs aldrig över.
@@ -115,6 +120,7 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.versionDrift` | `warn` | Versionsdrift varnar i stället för att stoppa |
 | `gitguard.sqlDialect` | `postgres` m.fl. | Annan SQL-dialekt (en `.sqlfluff` i repot vinner) |
 | `gitguard.protectedBranches` | `"main master"` | Blockera direkt push till de brancherna |
+| `gitguard.verbose` | `true` | Visa vilka filer som ingår, varje kommando och full dotnet-utdata |
 
 ---
 

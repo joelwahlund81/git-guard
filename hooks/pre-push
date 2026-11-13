@@ -12,8 +12,10 @@
 #   gitguard.versionDrift       error (standard) | warn
 #   gitguard.sqlDialect         tsql (standard) – ignoreras om repot har .sqlfluff
 #   gitguard.protectedBranches  t.ex. "main master" = blockera direkt push dit
+#   gitguard.verbose            true = visa filer, kommandon och full utdata
 #
 # Engångsundantag:  git push --no-verify   |   SKIP_TESTS=1 git push
+#                   GITGUARD_VERBOSE=1 git push   (detaljerad utdata en gång)
 
 set -uo pipefail
 
@@ -28,6 +30,42 @@ yellow() { printf '\033[33m! %s\033[0m\n' "$*"; }
 step()   { printf '\033[36m▸ %s\033[0m\n' "$*"; }
 detail() { printf '\033[90m    %s\033[0m\n' "$*"; }
 hint()   { printf '\033[90m    Rätta: %s\033[0m\n' "$*"; }
+
+verbose=0
+vcmd()   { [ "$verbose" -eq 1 ] && printf '\033[90m    $ %s\033[0m\n' "$*"; return 0; }
+
+# Sammanfattning: en rad per steg (ok / warn / fail / skip) som skrivs ut på slutet
+summary=()
+step_t0=$SECONDS
+begin()  { step_t0=$SECONDS; step "$*"; }
+record() {  # record <ok|warn|fail|skip> <steg> [kommentar]
+  summary+=("$1|$2|${3:-}|$((SECONDS - step_t0))")
+  step_t0=$SECONDS
+}
+print_summary() {
+  [ ${#summary[@]} -eq 0 ] && return 0
+  printf '\033[1;36m── Sammanfattning ─────────────────────────\033[0m\n'
+  local line s n why t icon color extra
+  for line in "${summary[@]}"; do
+    IFS='|' read -r s n why t <<< "$line"
+    case "$s" in
+      ok)   icon='✓'; color=32 ;;
+      warn) icon='!'; color=33 ;;
+      fail) icon='✗'; color=31 ;;
+      *)    icon='–'; color=90 ;;
+    esac
+    extra="$why"
+    if [ "$s" != skip ] && [ "${t:-0}" -gt 0 ]; then extra="${extra:+$extra, }${t}s"; fi
+    printf '\033[%sm%s %s\033[0m\033[90m%s\033[0m\n' "$color" "$icon" "$n" "${extra:+  ($extra)}"
+  done
+  printf '\033[90m  Totalt %ss\033[0m\n' "$SECONDS"
+}
+
+# Temporära filer städas även om pushen avbryts med Ctrl+C
+list=""
+cleanup() { [ -n "$list" ] && rm -f "$list"; return 0; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 cfg()      { local v; v="$(git config --get "gitguard.$1" 2>/dev/null)"; printf '%s' "${v:-${2:-}}"; }
 cfg_bool() { [ "$(git config --bool --get "gitguard.$1" 2>/dev/null)" = "true" ]; }
@@ -48,6 +86,7 @@ run_repo_hooks() {
     [ "$h" -ef "$0" ] && continue
     grep -q '^# git-guard pre-push hook' "$h" 2>/dev/null && continue
     step "Kör repots egen hook: $(basename "$h")"
+    repo_hook_ran=1
     printf '%s\n' "$input" | "$h" "$@" || return 1
   done
 }
@@ -57,6 +96,7 @@ if cfg_bool disable; then
   run_repo_hooks "$@"; exit $?
 fi
 cfg_bool skipTests && SKIP_TESTS=1
+{ cfg_bool verbose || [ "${GITGUARD_VERBOSE:-0}" = 1 ]; } && verbose=1
 
 printf '\033[1;36m── git-guard ──────────────────────────────\033[0m\n'
 
@@ -68,11 +108,13 @@ if [ -n "$protected" ]; then
     [ "$lsha" = "$ZERO" ] && continue
     for b in $protected; do
       if [ "$rref" = "refs/heads/$b" ]; then
-        red "Direkt push till '$b' är blockerad (gitguard.protectedBranches). Gör en PR."
-        fail=1
+        red "Direkt push till '$b' är blockerad (gitguard.protectedBranches)"
+        hint "pusha till en egen branch och skapa en PR:  git switch -c <ny-branch> && git push -u $remote HEAD"
+        fail=1; prot_fail=1
       fi
     done
   done <<< "$input"
+  if [ "${prot_fail:-0}" = 1 ]; then record fail "Skyddade brancher"; else record ok "Skyddade brancher"; fi
 fi
 
 # --- 1. Vilka filer ingår i pushen? -----------------------------------------
@@ -93,6 +135,7 @@ if [ ${#files[@]} -gt 0 ]; then
   while IFS= read -r f; do uniq_files+=("$f"); done < <(printf '%s\n' "${files[@]}" | sort -u)
   files=("${uniq_files[@]}")
   step "${#files[@]} ändrade fil(er) i pushen"
+  if [ "$verbose" -eq 1 ]; then for f in "${files[@]}"; do detail "$f"; done; fi
 else
   green "Inga ändrade filer att kontrollera"
 fi
@@ -103,8 +146,13 @@ has_file() {  # has_file <glob> – finns någon ändrad fil som matchar?
 
 # --- 2. Merge-konfliktmarkörer ----------------------------------------------
 if [ ${#files[@]} -gt 0 ]; then
+  step_t0=$SECONDS
   if grep -nIE '^(<<<<<<<|>>>>>>>)( |$)' -- "${files[@]}" 2>/dev/null; then
     red "Konfliktmarkörer hittade"; fail=1
+    hint "lös konflikten i filerna ovan, ta bort markörerna och gör en ny commit"
+    record fail "Konfliktmarkörer"
+  else
+    record ok "Konfliktmarkörer"
   fi
 fi
 
@@ -114,17 +162,22 @@ for f in "${files[@]+"${files[@]}"}"; do
   case "$f" in *.sql|*.SQL) sql_files+=("$f") ;; esac
 done
 if [ ${#sql_files[@]} -gt 0 ]; then
-  step "SQL-lint: ${#sql_files[@]} fil(er)"
+  begin "SQL-lint: ${#sql_files[@]} fil(er)"
   if command -v sqlfluff >/dev/null 2>&1; then
     dialect_arg=()
     [ -f .sqlfluff ] || dialect_arg=(--dialect "$(cfg sqlDialect tsql)")
+    vcmd sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"
     if sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"; then
-      green "SQL ok"
+      green "SQL ok"; record ok "SQL"
     else
-      red "SQL-lint misslyckades (sqlfluff fix <fil> kan rätta det mesta)"; fail=1
+      red "SQL-lint misslyckades"; fail=1
+      hint "sqlfluff fix <fil>   (rättar det mesta automatiskt)"
+      record fail "SQL"
     fi
   else
-    yellow "sqlfluff saknas (pip install sqlfluff) – hoppar över SQL"
+    yellow "sqlfluff saknas – hoppar över SQL"
+    hint "pip install sqlfluff   (eller .\\install-githooks.ps1 -InstallTools)"
+    record skip "SQL" "sqlfluff saknas"
   fi
 fi
 
@@ -134,33 +187,40 @@ fi
 # Körs i repots rot så att .gitleaks.toml och .gitleaksignore gäller. --redact maskerar fynden.
 if [ -n "$push_shas" ]; then
   if command -v gitleaks >/dev/null 2>&1; then
-    step "Söker efter hemligheter i commits som pushas"
+    begin "Söker efter hemligheter i commits som pushas"
     # shellcheck disable=SC2086  # push_shas är medvetet en lista
     log_opts="$(printf '%s ' $push_shas)--not --remotes=$remote"
+    vcmd gitleaks git --redact --log-opts="$log_opts" .
     if gitleaks git --help >/dev/null 2>&1; then
       leaks_out="$(gitleaks git --no-banner --redact -v --exit-code 42 --log-opts="$log_opts" . 2>&1)"; rc=$?
     else
       leaks_out="$(gitleaks detect --no-banner --redact -v --exit-code 42 --source . --log-opts="$log_opts" 2>&1)"; rc=$?
     fi
     if [ $rc -eq 0 ]; then
-      green "Inga hemligheter"
+      [ "$verbose" -eq 1 ] && printf '%s\n' "$leaks_out" | sed 's/^/    /'
+      green "Inga hemligheter"; record ok "Hemligheter"
     elif [ $rc -eq 42 ]; then
       printf '%s\n' "$leaks_out" | sed 's/^/    /'
       red "gitleaks hittade möjliga hemligheter i commits som ska pushas (maskerade ovan)"; fail=1
       hint "ta bort hemligheten ur commiten (git commit --amend, eller git rebase -i <commit>^) och byt nyckeln. Falsklarm: lägg fingeravtrycket i .gitleaksignore"
+      record fail "Hemligheter"
     else
       printf '%s\n' "$leaks_out" | tail -n 5 | sed 's/^/    /'
       yellow "gitleaks kunde inte köras (se ovan) – hemligheter kontrollerades inte"
+      record warn "Hemligheter" "gitleaks-fel"
     fi
   else
     yellow "gitleaks saknas – hemligheter kontrolleras inte"
     hint "winget install Gitleaks.Gitleaks   (eller .\\install-githooks.ps1 -InstallTools)"
+    record skip "Hemligheter" "gitleaks saknas"
   fi
 fi
 
 # --- 5. Låsfiler (npm) -------------------------------------------------------
 if has_file 'package.json' && [ -f package-lock.json ] && ! has_file 'package-lock.json'; then
-  yellow "package.json ändrad men inte package-lock.json – kör npm install och committa låsfilen om beroenden ändrats"
+  yellow "package.json ändrad men inte package-lock.json"
+  hint "npm install och committa package-lock.json om beroenden ändrats"
+  record warn "npm-låsfil"
 fi
 
 # --- 6. Har kod ändrats? -----------------------------------------------------
@@ -177,8 +237,15 @@ if ls ./*.sln ./*.slnx >/dev/null 2>&1 || [ -n "$(find . -maxdepth 5 \( -name '*
   is_dotnet=1
 fi
 
-cfg_bool skipDotnet && dotnet_done=1
+if [ $is_dotnet -eq 1 ] && cfg_bool skipDotnet; then
+  dotnet_done=1
+  yellow "Hoppar över .NET-kontrollerna (gitguard.skipDotnet)"
+  record skip ".NET" "gitguard.skipDotnet"
+elif [ $is_dotnet -eq 1 ] && [ $code_changed -eq 0 ]; then
+  record skip ".NET" "bara dokumentation ändrad"
+fi
 if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; then
+  step_t0=$SECONDS
   ps_exe=""
   for c in pwsh pwsh.exe powershell.exe powershell; do
     command -v "$c" >/dev/null 2>&1 && { ps_exe="$c"; break; }
@@ -186,11 +253,17 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; the
   check_script="$GG_HOME/checks/dotnet-check.ps1"
 
   if [ -z "$ps_exe" ]; then
-    yellow "PowerShell saknas – kör bara enkla .NET-tester (installera pwsh för fler kontroller)"
+    yellow "PowerShell saknas – kör bara enkla .NET-tester"
+    hint "winget install Microsoft.PowerShell"
+    record warn ".NET" "PowerShell saknas"
   elif [ ! -f "$check_script" ]; then
-    yellow "Hittar inte $check_script – kör installationsskriptet igen"
+    yellow "Hittar inte $check_script"
+    hint ".\\install-githooks.ps1 -Global   (i git-guard-mappen)"
+    record warn ".NET" "dotnet-check.ps1 saknas"
   elif ! command -v dotnet >/dev/null 2>&1; then
     yellow "dotnet saknas i PATH – hoppar över .NET-kontroller"; dotnet_done=1
+    hint "winget install Microsoft.DotNet.SDK.8   (eller en nyare version)"
+    record skip ".NET" "dotnet saknas"
   else
     list="$(mktemp)"
     printf '%s\n' "${files[@]+"${files[@]}"}" > "$list"
@@ -198,42 +271,70 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; the
              -DriftLevel "$(cfg versionDrift error)")
     [ "${SKIP_TESTS:-0}" = 1 ] && ps_args+=(-SkipTests)
     cfg_bool skipFormat && ps_args+=(-SkipFormat)
-    "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-      -File "$(to_native "$check_script")" "${ps_args[@]}" || fail=1
-    rm -f "$list"
+    [ "$verbose" -eq 1 ] && ps_args+=(-Detailed)
+    vcmd "$ps_exe" -File "$check_script" "${ps_args[@]}"
+    if "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+         -File "$(to_native "$check_script")" "${ps_args[@]}"; then
+      record ok ".NET"
+    else
+      fail=1; record fail ".NET"
+    fi
+    rm -f "$list"; list=""
     dotnet_done=1
   fi
 fi
 
 # --- 8. Tester (övriga språk + .NET-reserv) ---------------------------------
+# run_tests <namn> <verktyg> <kommando...> – kör ett testkommando om verktyget finns
+run_tests() {
+  local name="$1" tool="$2"; shift 2
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    yellow "$tool saknas – hoppar över $name"
+    record skip "$name" "$tool saknas"
+    return 0
+  fi
+  begin "$name"
+  vcmd "$@"
+  if "$@"; then
+    record ok "$name"
+  else
+    red "$name misslyckades"; fail=1
+    hint "kör '$*' och rätta testerna, eller pusha utan tester en gång: SKIP_TESTS=1 git push"
+    record fail "$name"
+  fi
+}
+
 if [ "${SKIP_TESTS:-0}" = 1 ]; then
   yellow "Hoppar över tester (SKIP_TESTS / gitguard.skipTests)"
+  record skip "Tester" "SKIP_TESTS / gitguard.skipTests"
 elif [ $code_changed -eq 0 ]; then
   [ ${#files[@]} -gt 0 ] && green "Bara dokumentation ändrad – hoppar över tester"
 else
-  if [ $is_dotnet -eq 1 ] && [ $dotnet_done -eq 0 ] && command -v dotnet >/dev/null 2>&1; then
-    step "dotnet test"
-    dotnet test --nologo -v q || { red "dotnet test misslyckades"; fail=1; }
+  if [ $is_dotnet -eq 1 ] && [ $dotnet_done -eq 0 ]; then
+    run_tests "dotnet test" dotnet dotnet test --nologo -v q
   fi
   if [ -f package.json ] && grep -q '"test"[[:space:]]*:' package.json \
      && ! grep -q 'no test specified' package.json; then
-    step "npm test"
-    npm test --silent || { red "npm test misslyckades"; fail=1; }
+    run_tests "npm test" npm npm test --silent
   fi
-  if { [ -f pyproject.toml ] || [ -f pytest.ini ]; } && command -v pytest >/dev/null 2>&1; then
-    step "pytest"
-    pytest -q || { red "pytest misslyckades"; fail=1; }
+  if [ -f pyproject.toml ] || [ -f pytest.ini ]; then
+    run_tests "pytest" pytest pytest -q
   fi
   if [ -f go.mod ]; then
-    step "go test"
-    go test ./... || { red "go test misslyckades"; fail=1; }
+    run_tests "go test" go go test ./...
   fi
 fi
 
 # --- 9. Repots egna hooks ----------------------------------------------------
-run_repo_hooks "$@" || fail=1
+step_t0=$SECONDS
+if run_repo_hooks "$@"; then
+  [ "${repo_hook_ran:-0}" = 1 ] && record ok "Repots egen hook"
+else
+  fail=1; record fail "Repots egen hook"
+fi
 
 # -----------------------------------------------------------------------------
+print_summary
 if [ $fail -ne 0 ]; then
   if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then red "Kontrollerna hittade fel (se ovan)"; else red "Push avbruten. Fixa felen ovan eller kör: git push --no-verify"; fi
   exit 1

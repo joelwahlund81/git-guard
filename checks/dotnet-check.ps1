@@ -18,6 +18,8 @@
       4. dotnet format på ändrade filer
       5. dotnet build: referenskonflikter (MSB3277), olösta referenser (MSB3245)
       6. dotnet test
+
+    -Detailed visar varje dotnet-kommando och hela utdatan.
 #>
 [CmdletBinding()]
 param(
@@ -27,7 +29,9 @@ param(
     [string]$DriftLevel = 'error',
     [switch]$SkipTests,
     [switch]$SkipFormat,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Visa varje dotnet-kommando och hela utdatan (gitguard.verbose / GITGUARD_VERBOSE=1)
+    [switch]$Detailed
 )
 
 # 'Continue': Windows PowerShell 5.1 avbryter annars när dotnet skriver till stderr
@@ -56,6 +60,17 @@ function Write-Detail([string]$m) {
 }
 function Write-Issue([string]$Level, [string]$m) {
     if ($Level -eq 'error') { Write-Bad $m } else { Write-Warn2 $m }
+}
+function Write-Skip([string]$m) { Write-Host "$E[90m- $m$E[0m" }
+
+# Med -Detailed: mer utdata från dotnet och inga avkortade fellistor
+$Verb = if ($Detailed) { 'minimal' } else { 'q' }
+$MaxLines = if ($Detailed) { 100000 } else { 15 }
+function Invoke-Dotnet([string[]]$DnArgs) {
+    if ($Detailed) { Write-Host "$E[90m    `$ dotnet $($DnArgs -join ' ')$E[0m" }
+    $o = @(& dotnet @DnArgs 2>&1 | ForEach-Object { "$_" })
+    if ($Detailed) { $o | ForEach-Object { Write-Detail $_ } }
+    return $o
 }
 $started = Get-Date
 
@@ -311,10 +326,10 @@ if ($script:ErrorCount -eq 0 -and $script:WarnCount -eq 0) {
 $lockFiles = @(Get-RepoFile @('packages.lock.json'))
 $restoreOk = $true
 foreach ($t in $targets) {
-    $dnArgs = @('restore', $t, '--nologo', '-v', 'q')
+    $dnArgs = @('restore', $t, '--nologo', '-v', $Verb)
     if ($lockFiles.Count -gt 0) { $dnArgs += '--locked-mode' }
     Write-Step ("dotnet restore" + $(if ($lockFiles.Count -gt 0) { ' --locked-mode' } else { '' }))
-    $out = & dotnet @dnArgs 2>&1 | ForEach-Object { "$_" }
+    $out = Invoke-Dotnet $dnArgs
     if ($LASTEXITCODE -ne 0) {
         $restoreOk = $false
         if ($lockFiles.Count -gt 0 -and ($out -match 'NU1004')) {
@@ -330,7 +345,7 @@ foreach ($t in $targets) {
         }
         $out | Where-Object { $_ -match 'error' } |
             ForEach-Object { ($_ -replace '^.*?error (NU\d{4}: )?', '' -replace 'Warning As Error: ', '').Trim() } |
-            Select-Object -Unique -First 15 | ForEach-Object { Write-Detail $_ }
+            Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_ }
     }
 }
 if ($restoreOk) { Write-Ok 'Restore ok' }
@@ -402,6 +417,13 @@ if ($restoreOk) {
 # 4. Formatering (bara ändrade filer)
 # =============================================================================
 $codeFiles = @($changed | Where-Object { $_ -match '\.(cs|vb|fs)$' -and (Test-Path -LiteralPath $_) })
+if ($SkipFormat) {
+    Write-Skip 'Hoppar över formatering (gitguard.skipFormat)'
+} elseif ($codeFiles.Count -eq 0) {
+    if ($ChangedFilesPath) { Write-Skip 'Formatering: inga ändrade .cs/.vb/.fs-filer' }
+} elseif (-not $restoreOk) {
+    Write-Skip 'Hoppar över formatering eftersom restore misslyckades'
+}
 if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
     $hasEditorConfig = (Test-Path -LiteralPath '.editorconfig')
     $mode = if ($hasEditorConfig) { 'style + whitespace (.editorconfig)' } else { 'whitespace' }
@@ -410,12 +432,12 @@ if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
     foreach ($t in $targets) {
         $dnArgs = @('format', $t)
         if (-not $hasEditorConfig) { $dnArgs += 'whitespace' }
-        $dnArgs += @('--verify-no-changes', '--no-restore', '-v', 'q', '--include') + $codeFiles
-        $out = & dotnet @dnArgs 2>&1 | ForEach-Object { "$_" }
+        $dnArgs += @('--verify-no-changes', '--no-restore', '-v', $Verb, '--include') + $codeFiles
+        $out = Invoke-Dotnet $dnArgs
         if ($LASTEXITCODE -ne 0) {
             $fmtOk = $false
             Write-Bad 'Formateringen avviker'
-            $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First 10 | ForEach-Object { Write-Detail $_.Trim() }
+            $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_.Trim() }
             Write-Detail ('Rätta: dotnet format' + $(if (-not $hasEditorConfig) { ' whitespace' } else { '' }) + ' och committa')
         }
     }
@@ -427,11 +449,13 @@ if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
 # =============================================================================
 $buildOk = $false
 $allRefIssues = 0
+if ($SkipBuild) { Write-Skip 'Hoppar över build (-SkipBuild)' }
+elseif (-not $restoreOk) { Write-Skip 'Hoppar över build eftersom restore misslyckades' }
 if (-not $SkipBuild -and $restoreOk) {
     Write-Step 'dotnet build'
     $buildOk = $true
     foreach ($t in $targets) {
-        $out = & dotnet build $t --no-restore --nologo -v q '-clp:NoSummary' 2>&1 | ForEach-Object { "$_" }
+        $out = Invoke-Dotnet @('build', $t, '--no-restore', '--nologo', '-v', $Verb, '-clp:NoSummary')
         $code = $LASTEXITCODE
         $refIssues = @($out | Where-Object { $_ -match 'warning (MSB3277|MSB3245|MSB3243|MSB3274|MSB3275)' } |
             ForEach-Object { ($_).Trim() } | Select-Object -Unique)
@@ -450,7 +474,7 @@ if (-not $SkipBuild -and $restoreOk) {
             $buildOk = $false
             Write-Bad "Bygget misslyckades: $(Split-Path $t -Leaf)"
             $out | Where-Object { $_ -match ': error ' } | ForEach-Object { ($_).Trim() } |
-                Select-Object -Unique -First 15 | ForEach-Object { Write-Detail $_ }
+                Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_ }
         }
     }
     if ($buildOk -and $allRefIssues -eq 0) { Write-Ok 'Build ok, inga referenskonflikter' }
@@ -470,8 +494,9 @@ if (-not $SkipTests) {
     } else {
         Write-Step "dotnet test ($($testProjects.Count) testprojekt)"
         foreach ($t in $targets) {
-            $dnArgs = @('test', $t, '--nologo', '-v', 'q')
+            $dnArgs = @('test', $t, '--nologo', '-v', $Verb)
             if (-not $SkipBuild) { $dnArgs += '--no-build' } else { $dnArgs += '--no-restore' }
+            if ($Detailed) { Write-Host "$E[90m    `$ dotnet $($dnArgs -join ' ')$E[0m" }
             & dotnet @dnArgs 2>&1 | ForEach-Object { Write-Host "    $_" }
             if ($LASTEXITCODE -ne 0) { Write-Bad 'Tester misslyckades' } else { Write-Ok 'Tester ok' }
         }
