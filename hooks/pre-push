@@ -20,6 +20,9 @@
 #   gitguard.sqlLint            error | warn | off – standard: error om repot har .sqlfluff,
 #                               annars warn
 #   gitguard.sqlDialect         tsql (standard) – ignoreras om repot har .sqlfluff
+#   gitguard.yamlLint           error | warn | off – tabbar och syntaxfel stoppar alltid (utom off).
+#                               Övriga yamllint/actionlint-anmärkningar: standard error om repot
+#                               har .yamllint (resp. .github/actionlint.yaml), annars warn
 #   gitguard.solution           sökväg till .sln/.slnx när repot har flera
 #   gitguard.testFilter         filter till dotnet test, t.ex. "Category!=Integration"
 #   gitguard.testTimeout        t.ex. "5m" = avbryt tester som hänger (--blame-hang-timeout)
@@ -278,6 +281,132 @@ elif [ ${#sql_files[@]} -gt 0 ]; then
     hint "pip install sqlfluff   (eller .\\install-githooks.ps1 -InstallTools)"
     record skip "SQL" "sqlfluff saknas"
   fi
+fi
+
+# --- 3. YAML (bara ändrade .yml/.yaml) ---------------------------------------
+# Tabbar i indraget och syntaxfel gör att filen inte går att läsa: de stoppar alltid.
+# Övriga anmärkningar (yamllint-regler, actionlint) stoppar bara med gitguard.yamlLint error,
+# eller när repot har en egen konfiguration för verktyget (då har teamet valt reglerna).
+yaml_files=()
+for f in "${files[@]+"${files[@]}"}"; do
+  case "$f" in
+    *.yml|*.yaml|*.YML|*.YAML)
+      # Helm- och andra Go-mallar ({{ ... }} först på en rad) är inte YAML förrän de renderats
+      if grep -qE '^[[:space:]]*\{\{' "$f" 2>/dev/null; then
+        [ "$verbose" -eq 1 ] && detail "hoppar över $f (mall med {{ }}, inte ren YAML)"
+        continue
+      fi
+      yaml_files+=("$f") ;;
+  esac
+done
+yaml_cfg="$(cfg yamlLint)"
+case "$yaml_cfg" in ""|error|warn|off) ;; *) yellow "Okänt värde gitguard.yamlLint='$yaml_cfg' (tillåtet: error warn off)"; yaml_cfg="" ;; esac
+yaml_set() {  # yaml_set <warn|fail|skip> <kommentar> – det allvarligaste vinner
+  case "$1:$yaml_state" in
+    fail:*|warn:ok|warn:skip|skip:ok) yaml_state="$1" ;;
+  esac
+  yaml_why="${yaml_why:+$yaml_why, }$2"
+}
+if [ ${#yaml_files[@]} -gt 0 ] && [ "$yaml_cfg" = off ]; then
+  record skip "YAML" "gitguard.yamlLint off"
+elif [ ${#yaml_files[@]} -gt 0 ]; then
+  begin "YAML: ${#yaml_files[@]} fil(er)"
+  yaml_state=ok; yaml_why=""
+
+  # Tab först på en rad är aldrig giltigt indrag. Tabbar efter mellanslag (t.ex. i ett
+  # skript under run: |) och tab före en kommentar är tillåtna och flaggas inte.
+  tab="$(printf '\t')"
+  tabs_out="$(printf '%s\0' "${yaml_files[@]}" | xargs -0 grep -nHE "^${tab}[[:space:]]*[^[:space:]#]" -- 2>/dev/null \
+              | sed -E 's/^([^:]*:[0-9]+):.*/\1/' | head -n 20)"
+  if [ -n "$tabs_out" ]; then
+    printf '%s\n' "$tabs_out" | sed 's/^/    /'
+    red "Tabbar i indraget – YAML tillåter bara mellanslag"; fail=1
+    hint "byt tabbarna mot mellanslag på raderna ovan (VS Code: Ctrl+Shift+P > Convert Indentation to Spaces)"
+    yaml_set fail "tabbar"
+  fi
+
+  # yamllint: syntax och regler. Utan egen .yamllint i repot gäller avslappnade regler, och
+  # radslut (CRLF på Windows) och radlängd kontrolleras inte.
+  yl_own=0
+  for c in .yamllint .yamllint.yaml .yamllint.yml; do [ -f "$c" ] && yl_own=1; done
+  yl_level="$yaml_cfg"
+  if [ -z "$yl_level" ]; then if [ $yl_own -eq 1 ]; then yl_level=error; else yl_level=warn; fi; fi
+  if command -v yamllint >/dev/null 2>&1; then
+    yl_args=(-f parsable)
+    [ $yl_own -eq 1 ] || yl_args+=(-d '{extends: relaxed, rules: {new-lines: disable, line-length: disable, trailing-spaces: {level: warning}, new-line-at-end-of-file: {level: warning}}}')
+    vcmd yamllint "${yl_args[@]}" "${yaml_files[@]}"
+    yl_out="$(yamllint "${yl_args[@]}" -- "${yaml_files[@]}" 2>&1 | tr -d '\r')"; yl_rc=$?
+    yl_syntax="$(printf '%s\n' "$yl_out" | grep -E '\[error\] .*\(syntax\)$')"
+    yl_errors="$(printf '%s\n' "$yl_out" | grep -E '\[error\]' | grep -vE '\(syntax\)$')"
+    yl_warns="$(printf '%s\n' "$yl_out" | grep -E '\[warning\]')"
+    if [ $yl_rc -ne 0 ] && [ -z "$yl_syntax$yl_errors$yl_warns" ]; then
+      printf '%s\n' "$yl_out" | tail -n 5 | sed 's/^/    /'
+      yellow "yamllint kunde inte köras (se ovan) – YAML-syntaxen kontrollerades inte"
+      [ $yl_own -eq 1 ] && hint "kontrollera repots .yamllint:  yamllint ."
+      yaml_set warn "yamllint-fel"
+    else
+      [ -n "$yl_out" ] && printf '%s\n' "$yl_out" | sed 's/^/    /'
+      if [ -n "$yl_syntax" ]; then
+        red "Syntaxfel i YAML – filen går inte att läsa"; fail=1
+        hint "raden som pekas ut ovan. Vanligast: fel indrag, ett kolon i ett värde som behöver citattecken, eller - och : utan mellanslag efter"
+        yaml_set fail "syntaxfel"
+      fi
+      if [ -n "$yl_errors" ] && [ "$yl_level" = error ]; then
+        red "yamllint hittade fel (regeln står inom parentes)"; fail=1
+        if [ $yl_own -eq 1 ]; then hint "raderna ovan, eller ändra regeln i repots .yamllint"
+        else hint "raderna ovan, eller låt dem bara varna:  git config gitguard.yamlLint warn"; fi
+        yaml_set fail "yamllint"
+      elif [ -n "$yl_errors$yl_warns" ]; then
+        if [ $yl_own -eq 1 ]; then yellow "yamllint hittade anmärkningar (varning – gitguard.yamlLint warn)"
+        else yellow "yamllint hittade anmärkningar (varning – repot har ingen .yamllint)"; fi
+        hint "raderna ovan. Lägg en .yamllint i repot om teamets regler ska gälla och stoppa"
+        yaml_set warn "yamllint"
+      fi
+    fi
+  else
+    yellow "yamllint saknas – YAML-syntaxen kontrolleras inte (bara tabbar)"
+    hint "pip install yamllint   (eller .\\install-githooks.ps1 -InstallTools)"
+    yaml_set skip "yamllint saknas"
+  fi
+
+  # actionlint: GitHub Actions-workflows (okända nycklar, fel i ${{ }}-uttryck, shellcheck i run:)
+  wf_files=()
+  for f in "${yaml_files[@]}"; do case "$f" in .github/workflows/*) wf_files+=("$f") ;; esac; done
+  if [ ${#wf_files[@]} -gt 0 ]; then
+    al_level="$yaml_cfg"
+    if [ -z "$al_level" ]; then
+      if [ -f .github/actionlint.yaml ] || [ -f .github/actionlint.yml ]; then al_level=error; else al_level=warn; fi
+    fi
+    if command -v actionlint >/dev/null 2>&1; then
+      vcmd actionlint -oneline "${wf_files[@]}"
+      al_out="$(actionlint -no-color -oneline -- "${wf_files[@]}" 2>&1 | tr -d '\r')"; al_rc=$?
+      if [ $al_rc -eq 0 ]; then
+        :
+      elif [ $al_rc -eq 1 ]; then
+        printf '%s\n' "$al_out" | sed 's/^/    /'
+        if [ "$al_level" = error ]; then
+          red "actionlint hittade fel i GitHub Actions-workflows"; fail=1
+          hint "raderna ovan, eller låt dem bara varna:  git config gitguard.yamlLint warn"
+          yaml_set fail "actionlint"
+        else
+          yellow "actionlint hittade anmärkningar i GitHub Actions-workflows (varning)"
+          hint "raderna ovan. Lägg en .github/actionlint.yaml i repot om de ska stoppa"
+          yaml_set warn "actionlint"
+        fi
+      else
+        printf '%s\n' "$al_out" | tail -n 5 | sed 's/^/    /'
+        yellow "actionlint kunde inte köras (se ovan) – workflows kontrollerades bara som YAML"
+        yaml_set warn "actionlint-fel"
+      fi
+    else
+      yellow "actionlint saknas – GitHub Actions-workflows kontrolleras bara som YAML"
+      hint "winget install rhysd.actionlint   (eller .\\install-githooks.ps1 -InstallTools)"
+      yaml_set skip "actionlint saknas"
+    fi
+  fi
+
+  [ "$yaml_state" = ok ] && green "YAML ok"
+  record "$yaml_state" "YAML" "$yaml_why"
 fi
 
 # --- 4. Hemligheter ----------------------------------------------------------

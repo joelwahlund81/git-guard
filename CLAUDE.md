@@ -123,6 +123,9 @@ hooken som `git push` gör. Lägg till ett scenario för varje ny kontroll eller
 | Felaktiga mellanslag i ändrad `.cs` | Fel: formatering |
 | Test som failar / samma med `gitguard.testFilter` | Fel / grönt |
 | Bara `.sql` eller bara dokumentation ändrad | .NET hoppas över |
+| `.yml` med tab först på en rad / tab i ett `run: \|`-skript / `yamlLint=off` | Fel / inget fel / inget fel |
+| YAML-syntaxfel, dubbla nycklar, Helm-mall (kräver yamllint) | Fel / varning (fel med `.yamllint`) / hoppas över |
+| Workflow utan `runs-on` (kräver actionlint) | Varning, fel med `yamlLint=error` |
 | Skyddad branch, konfliktmarkörer | Fel |
 | Ocommittad ändring i en pushad fil | Varning |
 | `gg` (torrkörning) med en egen repo-hook | Hooken körs inte (men vid riktig push) |

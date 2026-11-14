@@ -15,6 +15,7 @@ $global:GGSettings = @(
     @{ Key = 'existingIssues';    Default = 'warn';         Values = 'warn|error';               Desc = 'Problem i .NET-filer som pushen inte rör: varna (fanns redan) eller stoppa' }
     @{ Key = 'sqlLint';           Default = 'error/warn';   Values = 'error|warn|off';           Desc = 'SQL-lint: standard error om repot har .sqlfluff, annars warn' }
     @{ Key = 'sqlDialect';        Default = 'tsql';         Values = 'postgres, mysql ...';      Desc = 'SQL-dialekt (en .sqlfluff i repot vinner)' }
+    @{ Key = 'yamlLint';          Default = 'error/warn';   Values = 'error|warn|off';           Desc = 'yamllint/actionlint: standard error om repot har egen konfig, annars warn. Tabbar och syntaxfel stoppar alltid' }
     @{ Key = 'solution';          Default = '(första)';     Values = 'src/App.sln';              Desc = 'Vilken solution som byggs när repot har flera' }
     @{ Key = 'testFilter';        Default = '(inget)';      Values = '"Category!=Integration"';  Desc = 'Filter till dotnet test' }
     @{ Key = 'testTimeout';       Default = '(ingen)';      Values = '5m';                       Desc = 'Avbryt tester som hänger' }
@@ -98,12 +99,15 @@ function global:Show-GitGuardStatus {
         pwsh       = 'PowerShell 7, rekommenderas (klarar stora project.assets.json)'
         gitleaks   = 'hemlighetssökning'
         sqlfluff   = 'SQL-lint'
+        yamllint   = 'YAML-syntax och regler'
+        actionlint = 'GitHub Actions-workflows'
         'git-lfs'  = 'stora filer (om repot använder LFS)'
         az         = 'Azure-kommandon (azs, azl, azset)'
     }
     $install = @{
         dotnet = 'winget install Microsoft.DotNet.SDK.8'; pwsh = 'winget install Microsoft.PowerShell'
         gitleaks = 'winget install Gitleaks.Gitleaks'; sqlfluff = 'pip install sqlfluff'
+        yamllint = 'pip install yamllint'; actionlint = 'winget install rhysd.actionlint'
         'git-lfs' = 'winget install GitHub.GitLFS'; az = 'winget install Microsoft.AzureCLI'
     }
     foreach ($t in $tools.Keys) {
@@ -207,7 +211,7 @@ function global:Show-GitGuardHelp {
                 @('Skyddade brancher', 'stoppar direkt push till gitguard.protectedBranches'),
                 @('Ändrade filer',     'bara filer i commits som inte finns på servern kontrolleras'),
                 @('Konfliktmarkörer',  'kvarglömda <<<<<<< / >>>>>>>'),
-                @('SQL',               'sqlfluff på ändrade .sql (stoppar bara med .sqlfluff i repot)'),
+                @('SQL och YAML',      'sqlfluff på .sql, yamllint/actionlint på .yml (tabbar och syntaxfel stoppar alltid)'),
                 @('Hemligheter',       'gitleaks på de commits som pushas, maskerat'),
                 @('npm-låsfil',        'package.json ändrad utan package-lock.json (varning)'),
                 @('.NET',              'paket/DLL-referenser, restore, sårbarheter, format, build, test'),
@@ -230,7 +234,8 @@ function global:Show-GitGuardHelp {
                 @('Push tar lång tid', 'kör gg först (sparas), git config gitguard.skipTests true, eller låt pipelinen testa'),
                 @('Hooken körs inte', 'ggstatus. Har repot egen core.hooksPath (husky) gäller inte git-guard'),
                 @('"running scripts is disabled"', 'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned'),
-                @('gitleaks/sqlfluff saknas', '.\install-githooks.ps1 -InstallTools'),
+                @('gitleaks/yamllint m.fl. saknas', '.\install-githooks.ps1 -InstallTools'),
+                @('YAML-falsklarm (mallar)', '{{ }} först på en rad hoppas över. Annars: git config gitguard.yamlLint off'),
                 @("`$'\r': command not found", 'hooken har fått CRLF: kör installationsskriptet igen'),
                 @('Ikoner visas som rutor', 'välj typsnittet MesloLGM Nerd Font i terminalen'),
                 @('Ett kommando fungerar inte', 'reload, och gghelp <kommando>. Uppdatera: ggupdate')

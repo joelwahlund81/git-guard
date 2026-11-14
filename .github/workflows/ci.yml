@@ -13,6 +13,11 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: yamllint och actionlint (för YAML-testerna)
+        run: python -m pip install yamllint actionlint-py
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
@@ -36,6 +41,11 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: yamllint och actionlint (för YAML-testerna)
+        run: python -m pip install yamllint actionlint-py
       - name: shellcheck
         run: shellcheck -S warning hooks/*
       - name: Alla tester

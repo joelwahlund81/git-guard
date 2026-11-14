@@ -376,6 +376,38 @@ $scenarios['utf-16 sql'] = {
     Assert-Hook 'UTF-16-kodad .sql: varning' (Invoke-Hook $r) 0 @('är sparad som UTF-16', 'Rätta: spara filen som UTF-8')
 }
 
+$scenarios['yaml tabbar'] = {
+    $r = New-TestRepo 'yamltabs' @{}
+    Add-Commit $r @{ 'ok.yml' = "steps:`n  - run: |`n      make`n      `techo tab efter mellanslag`n" }
+    Assert-Hook 'tab i ett run:-skript: inget fel' (Invoke-Hook $r) 0 @() @('Tabbar i indraget')
+    Add-Commit $r @{ 'bad.yml' = "a:`n`tb: 1`n" }
+    Assert-Hook 'tab först på en rad i .yml: fel' (Invoke-Hook $r) 1 @('Tabbar i indraget', 'bad.yml:2', 'Rätta:')
+    Invoke-Git $r config gitguard.yamlLint off | Out-Null
+    Assert-Hook 'gitguard.yamlLint off: ingen YAML-kontroll' (Invoke-Hook $r) 0 @('gitguard.yamlLint off') @('Tabbar i indraget')
+}
+
+$scenarios['yaml-lint'] = {
+    if (-not (Get-Command yamllint -ErrorAction SilentlyContinue)) { Write-SkipT 'yaml-lint: yamllint saknas'; return }
+    $r = New-TestRepo 'yamllint' @{}
+    Add-Commit $r @{ 'a.yml' = "a: b: c`n" }
+    Assert-Hook 'YAML-syntaxfel: fel' (Invoke-Hook $r) 1 @('Syntaxfel i YAML', 'a.yml:1', 'Rätta:')
+    Add-Commit $r @{ 'a.yml' = "a: 1`na: 2`n" }
+    Assert-Hook 'dubbla nycklar utan .yamllint: varning' (Invoke-Hook $r) 0 @('key-duplicates', 'repot har ingen .yamllint') @('Syntaxfel')
+    Add-Commit $r @{ '.yamllint' = "extends: relaxed`n" }
+    Assert-Hook 'dubbla nycklar med .yamllint i repot: fel' (Invoke-Hook $r) 1 @('yamllint hittade fel', 'key-duplicates')
+    Add-Commit $r @{ 'a.yml' = "a: 1`n"; 'chart/templates/d.yaml' = "{{- if .Values.on }}`nkind: X`n{{- end }}`n" }
+    Assert-Hook 'Helm-mall hoppas över, giltig YAML: ok' (Invoke-Hook $r) 0 @('YAML ok') @('Syntaxfel')
+}
+
+$scenarios['actionlint'] = {
+    if (-not (Get-Command actionlint -ErrorAction SilentlyContinue)) { Write-SkipT 'actionlint: actionlint saknas'; return }
+    $r = New-TestRepo 'actionlint' @{}
+    Add-Commit $r @{ '.github/workflows/ci.yml' = "on: push`njobs:`n  b:`n    steps:`n      - run: echo hej`n" }
+    Assert-Hook 'workflow utan runs-on: varning' (Invoke-Hook $r) 0 @('runs-on', 'actionlint hittade anmärkningar')
+    Invoke-Git $r config gitguard.yamlLint error | Out-Null
+    Assert-Hook 'workflow utan runs-on med yamlLint=error: fel' (Invoke-Hook $r) 1 @('actionlint hittade fel', 'Rätta:')
+}
+
 $scenarios['konfliktmarkörer'] = {
     $r = New-TestRepo 'conflict' @{}
     Add-Commit $r @{ 'a.txt' = "<<<<<<< HEAD`nx`n=======`ny`n>>>>>>> other`n" }

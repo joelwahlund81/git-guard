@@ -11,7 +11,7 @@
                        En befintlig pre-push döps om till pre-push.local och körs ändå.
       -Depth <n>       Hur djupt -Path letar efter repon (standard 3).
       -Interactive     Fråga för varje repo.
-      -InstallTools    Installera sqlfluff och gitleaks (och PowerShell 7 om det saknas).
+      -InstallTools    Installera sqlfluff, yamllint, actionlint och gitleaks (och PowerShell 7 om det saknas).
       -Uninstall       Ta bort hooken. Med -Purge tas även ~/.git-guard bort.
       -Force           Ersätt en global core.hooksPath som pekar någon annanstans (t.ex. husky).
       -WhatIf          Visa vad som skulle hända utan att ändra något.
@@ -140,17 +140,28 @@ function Install-Tools {
         } elseif (Get-Command brew -ErrorAction SilentlyContinue) { brew install gitleaks }
         else { Write-Note 'Installera gitleaks: https://github.com/gitleaks/gitleaks' }
     }
-    if (-not (Get-Command sqlfluff -ErrorAction SilentlyContinue)) {
-        $py = @('py', 'python', 'python3') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
-        if ((Get-Command pipx -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess('sqlfluff', 'pipx install')) {
+    if (-not (Get-Command actionlint -ErrorAction SilentlyContinue)) {
+        if ($hasWinget -and $PSCmdlet.ShouldProcess('actionlint', 'winget install')) {
+            winget install --id rhysd.actionlint @wingetArgs
+        } elseif (Get-Command brew -ErrorAction SilentlyContinue) { brew install actionlint }
+        else { Write-Note 'Installera actionlint: https://github.com/rhysd/actionlint' }
+    }
+    $pyTools = @(@('sqlfluff', 'yamllint') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    $py = @('py', 'python', 'python3') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+    $hasPipx = [bool](Get-Command pipx -ErrorAction SilentlyContinue)
+    if ($pyTools.Count -gt 0 -and -not $hasPipx -and -not $py) {
+        if ($hasWinget) { Write-Note "Python saknas ($($pyTools -join ', ')). Kör: winget install -e --id Python.Python.3.12   och sedan skriptet igen" }
+        else { Write-Note "Installera Python och kör: pip install $($pyTools -join ' ')" }
+        $pyTools = @()
+    }
+    foreach ($tool in $pyTools) {
+        if ($hasPipx -and $PSCmdlet.ShouldProcess($tool, 'pipx install')) {
             # pipx lägger programmet i en mapp som redan finns i PATH (pipx ensurepath)
-            pipx install sqlfluff
-        } elseif ($py -and $PSCmdlet.ShouldProcess('sqlfluff', 'pip install')) {
-            & $py -m pip install --user --upgrade sqlfluff
-            Test-UserScriptsInPath $py 'sqlfluff'
-        } elseif ($hasWinget) {
-            Write-Note 'Python saknas. Kör: winget install -e --id Python.Python.3.12   och sedan skriptet igen'
-        } else { Write-Note 'Installera Python och kör: pip install sqlfluff' }
+            pipx install $tool
+        } elseif (-not $hasPipx -and $PSCmdlet.ShouldProcess($tool, 'pip install')) {
+            & $py -m pip install --user --upgrade $tool
+            Test-UserScriptsInPath $py $tool
+        }
     }
     # Hämta nya PATH-värden så att nyinstallerade verktyg hittas direkt
     if ($IsWin) {
@@ -165,6 +176,8 @@ function Show-Tools {
         dotnet   = '.NET-kontroller'
         pwsh     = 'rekommenderas för .NET-kontrollerna (annars Windows PowerShell)'
         sqlfluff = 'SQL-lint'
+        yamllint = 'YAML-syntax och regler'
+        actionlint = 'GitHub Actions-workflows'
         gitleaks = 'hemlighetssökning'
     }
     foreach ($t in $tools.Keys) {
@@ -172,7 +185,7 @@ function Show-Tools {
         else { Write-Host "  [ ] $t" -ForegroundColor DarkGray -NoNewline }
         Write-Host "  - $($tools[$t])" -ForegroundColor DarkGray
     }
-    $missing = @('sqlfluff', 'gitleaks', 'pwsh') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+    $missing = @('sqlfluff', 'yamllint', 'actionlint', 'gitleaks', 'pwsh') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
     if ($missing) { Write-Host "  Installera det som saknas: .\install-githooks.ps1 -InstallTools" -ForegroundColor DarkGray }
 }
 
@@ -181,7 +194,7 @@ if (-not $Global -and -not $Path -and -not $InstallTools) {
     Write-Info 'git-guard - installation'
     Write-Host '  1) Installera globalt för alla repon (rekommenderas)'
     Write-Host '  2) Installera i utvalda repon i en mapp'
-    Write-Host '  3) Installera verktyg (sqlfluff, gitleaks, PowerShell 7)'
+    Write-Host '  3) Installera verktyg (sqlfluff, yamllint, actionlint, gitleaks, PowerShell 7)'
     Write-Host '  4) Avinstallera globalt'
     switch ((Read-Host 'Välj 1-4').Trim()) {
         '1' { $Global = $true; $InstallTools = ((Read-Host 'Installera även verktyg? [J/n]') -notmatch '^n') }

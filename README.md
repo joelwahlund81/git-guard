@@ -18,7 +18,7 @@ cd $HOME\.git-guard
 # 2. Tillåt lokala skript (bara första gången)
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
-# 3. Koppla in hooken globalt och installera verktyg (sqlfluff, gitleaks)
+# 3. Koppla in hooken globalt och installera verktyg (sqlfluff, yamllint, actionlint, gitleaks)
 .\install-githooks.ps1 -Global -InstallTools
 
 # 4. Terminalen: prompt med git-status, typsnitt och kommandon (valfritt)
@@ -49,6 +49,7 @@ Hooken går igenom stegen i ordning. Ett **✗** stoppar pushen, ett **!** är b
 | 1 | Ändrade filer | Tar fram filerna i commits som inte finns på remoten än. Resten av stegen tittar bara på dem. Varnar om du har ocommittade ändringar i dem eller pushar en annan commit än HEAD, eftersom kontrollerna läser filerna på disk | ! |
 | 2 | Konfliktmarkörer | Letar efter kvarglömda `<<<<<<<` / `>>>>>>>` | ✗ |
 | 3 | SQL | `sqlfluff lint` på ändrade `.sql`-filer (T-SQL som standard). Stoppar bara om repot har en `.sqlfluff`, annars varning | ✗ / ! |
+| | YAML | Ändrade `.yml`/`.yaml`: tabbar i indraget och syntaxfel (`yamllint`) stoppar alltid, eftersom filen inte går att läsa. Övriga yamllint-regler stoppar bara om repot har en `.yamllint`, annars varning. GitHub Actions-workflows kontrolleras även med `actionlint`, som stoppar om repot har `.github/actionlint.yaml`. Helm-mallar (`{{ }}` först på en rad) hoppas över. Azure Pipelines kan inte valideras mot schemat utan nätverk, det görs i pipelinen | ✗ / ! |
 | 4 | Hemligheter | `gitleaks` på de commits som pushas: lösenord, nycklar, tokens. Hittar även hemligheter som tagits bort i en senare commit. Fynden visas maskerade, och repots `.gitleaks.toml`/`.gitleaksignore` gäller | ✗ |
 | 5 | npm-låsfil | `package.json` ändrad men inte `package-lock.json` | ! |
 | 6 | .NET | Kör `checks/dotnet-check.ps1`, se nedan | ✗ |
@@ -62,7 +63,7 @@ hoppas .NET-stegen över.
 **Snabbare andra gången:** när en körning är helt grön sparas resultatet i `.git/git-guard-ok`. Kör du
 `gg` och sedan `git push` utan att ändra något, hoppas .NET och testerna över vid pushen. Det gäller
 bara när exakt samma innehåll pushas, arbetskatalogen är ren och inställningarna är desamma.
-Saknas ett verktyg (sqlfluff, gitleaks, dotnet, npm, pytest, go) hoppas steget över med en varning.
+Saknas ett verktyg (sqlfluff, yamllint, actionlint, gitleaks, dotnet, npm, pytest, go) hoppas steget över med en varning.
 Varje steg som hoppas över säger varför, och sist kommer en **sammanfattning** med en rad per steg
 och hur lång tid det tog. Vill du se exakt vad som körs: `GITGUARD_VERBOSE=1 git push` (en gång)
 eller `git config gitguard.verbose true`.
@@ -192,6 +193,7 @@ Ta bort en inställning med `git config --unset <nyckel>`.
 | `gitguard.testFilter` | `"Category!=Integration"` | Filter till `dotnet test`, t.ex. för att hoppa över tester som kräver databas eller Azure |
 | `gitguard.testTimeout` | `5m` | Avbryt tester som hänger (`--blame-hang-timeout`) i stället för att pushen fastnar |
 | `gitguard.sqlDialect` | `postgres` m.fl. | Annan SQL-dialekt (en `.sqlfluff` i repot vinner) |
+| `gitguard.yamlLint` | `error` / `warn` / `off` | Hur yamllint- och actionlint-anmärkningar ska räknas. Standard: `error` om repot har en egen konfiguration för verktyget (`.yamllint`, `.github/actionlint.yaml`), annars `warn`. Tabbar och syntaxfel stoppar alltid, utom med `off` |
 | `gitguard.protectedBranches` | `"main master release/*"` | Blockera direkt push till de brancherna (jokertecken går bra) |
 | `gitguard.verbose` | `true` | Visa vilka filer som ingår, varje kommando och full dotnet-utdata |
 | `gitguard.startup` | `full` / `short` / `off` | Startmeddelandet i terminalen (standard: `full` i Windows Terminal, annars `short`) |
