@@ -312,10 +312,12 @@ $scenarios['låsfil'] = {
 $scenarios['transitiv drift'] = {
     $r = New-TestRepo 'transitive' @{ 'A/A.csproj' = (Get-Csproj); 'B/B.csproj' = (Get-Csproj) }
     Set-Fast $r
+    # Tredjepartspaket: Microsoft.Extensions.* kan från .NET 10 tas bort av NuGet (pruning, NU1510)
+    # eftersom plattformen redan har dem, och då finns ingen drift att hitta.
     Add-Commit $r @{
-        'A/A.csproj' = (Get-Csproj '<PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />')
-        'B/B.csproj' = (Get-Csproj '<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="6.0.0" />') }
-    Assert-Hook 'transitivt beroende i olika versioner: varning' (Invoke-Hook $r) 0 @('löses till olika versioner', 'Microsoft.Extensions.DependencyInjection.Abstractions')
+        'A/A.csproj' = (Get-Csproj '<PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />')
+        'B/B.csproj' = (Get-Csproj '<PackageReference Include="Serilog" Version="3.1.1" />') }
+    Assert-Hook 'transitivt beroende i olika versioner: varning' (Invoke-Hook $r) 0 @('löses till olika versioner', 'Serilog [')
 }
 
 $scenarios['formatering'] = {

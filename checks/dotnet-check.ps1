@@ -102,6 +102,7 @@ function Get-NuLabel([string]$Code) {
         'NU1004' { return 'packages.lock.json är i osynk' }
         'NU1101|NU1102|NU1103' { return 'Paket eller version hittades inte' }
         'NU1301' { return 'Kunde inte nå paketkällan' }
+        'NU1510' { return 'Onödig PackageReference (paketet ingår redan i plattformen)' }
         default { return 'NuGet' }
     }
 }
@@ -515,6 +516,7 @@ if ($restoreOk) {
         if ($log.code -match 'NU190[1-4]') { Write-Detail "Rätta: uppdatera paketet $($log.libraryId) till en version utan sårbarheten (dotnet list package --vulnerable --include-transitive)" }
         elseif ($log.code -eq 'NU1605') { Write-Detail 'Rätta: höj den direkta PackageReference till den version som beroendet kräver' }
         elseif ($log.code -eq 'NU1107') { Write-Detail 'Rätta: lägg till en direkt PackageReference med en version som passar alla beroenden' }
+        elseif ($log.code -eq 'NU1510') { Write-Detail "Rätta: ta bort PackageReference till $($log.libraryId) (eller villkora den per TargetFramework om projektet har flera)" }
     }
 
     $transDrift = @($resolved.Values | Where-Object { $_.Versions.Count -gt 1 } | Sort-Object Id)

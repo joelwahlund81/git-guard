@@ -119,7 +119,7 @@ hooken som `git push` gör. Lägg till ett scenario för varje ny kontroll eller
 | Olika versioner av ett paket i villkorade ItemGroups (per TFM) | Ingen drift |
 | Projekt med `ManagePackageVersionsCentrally=false` i ett CPM-repo | Inget CPM-fel. `Version=` i ett CPM-projekt: fel |
 | `RestorePackagesWithLockFile` + ändrad version utan ny låsfil | Fel: låsfil i osynk (NU1004) |
-| Projekt A får paket X 8.0 transitivt, projekt B har X 6.0 direkt | Varning: transitiv drift |
+| Projekt A får paket X 4.0 transitivt, projekt B har X 3.1 direkt (tredjepartspaket, inte `Microsoft.Extensions.*` som kan tas bort av NuGet i .NET 10) | Varning: transitiv drift |
 | Felaktiga mellanslag i ändrad `.cs` | Fel: formatering |
 | Test som failar / samma med `gitguard.testFilter` | Fel / grönt |
 | Bara `.sql` eller bara dokumentation ändrad | .NET hoppas över |
