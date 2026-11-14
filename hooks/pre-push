@@ -222,7 +222,12 @@ elif [ -n "$dirty" ]; then
 fi
 
 has_file() {  # has_file <glob> – finns någon ändrad fil som matchar?
-  local f; for f in "${files[@]+"${files[@]}"}"; do case "$f" in $1) return 0 ;; esac; done; return 1
+  local f
+  for f in "${files[@]+"${files[@]}"}"; do
+    # shellcheck disable=SC2254  # $1 är medvetet ett mönster, t.ex. '*.csproj'
+    case "$f" in $1) return 0 ;; esac
+  done
+  return 1
 }
 
 # --- 2. Merge-konfliktmarkörer ----------------------------------------------
