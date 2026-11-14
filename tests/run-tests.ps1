@@ -442,6 +442,20 @@ $scenarios['passthrough'] = {
     if ($LASTEXITCODE -ne 0) { Write-Pass 'repots commit-msg körs via git-guard (global hooksPath)' } else { Write-Fail 'repots commit-msg kördes inte via passthrough' }
 }
 
+$scenarios['lfs utan gitattributes'] = {
+    if (-not (Get-Command git-lfs -ErrorAction SilentlyContinue)) { Write-SkipT 'lfs utan gitattributes: git-lfs saknas'; return }
+    $r = New-TestRepo 'nolfs' @{}
+    Add-Commit $r @{ 'a.txt' = "x`n" }
+    # Som BSD/macOS xargs: kör inte kommandot alls på tom indata (och returnerar 0)
+    $shim = Join-Path $Work 'bsd-xargs'
+    Set-File (Join-Path $shim 'xargs') "#!/usr/bin/env bash`ndata=`"`$(cat; echo x)`"; data=`"`${data%x}`"`n[ -z `"`$data`" ] && exit 0`nprintf '%s' `"`$data`" | /usr/bin/xargs `"`$@`"`n"
+    if (-not $IsWin) { & chmod +x (Join-Path $shim 'xargs') }
+    # Via BASH_ENV, eftersom Git for Windows bash.exe själv lägger /usr/bin först i PATH
+    $envFile = Join-Path $shim 'env.sh'
+    Set-File $envFile "d=`"`$(dirname `"`${BASH_SOURCE[0]}`")`"; command -v cygpath >/dev/null 2>&1 && d=`"`$(cygpath -u `"`$d`")`"; PATH=`"`$d:`$PATH`"`n"
+    Assert-Hook 'repo utan .gitattributes (BSD-xargs): git lfs körs inte' (Invoke-Hook $r @{ BASH_ENV = ($envFile -replace '\\', '/') }) 0 @('Alla kontroller ok') @('git lfs pre-push')
+}
+
 $scenarios['hemligheter'] = {
     if (-not (Get-Command gitleaks -ErrorAction SilentlyContinue)) { Write-SkipT 'hemligheter: gitleaks saknas'; return }
     $r = New-TestRepo 'secrets' @{}

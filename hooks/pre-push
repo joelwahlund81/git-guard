@@ -135,7 +135,9 @@ run_repo_hooks() {
 }
 uses_lfs() {
   command -v git-lfs >/dev/null 2>&1 || return 1
-  git ls-files -z -- .gitattributes '*/.gitattributes' 2>/dev/null | xargs -0 grep -qs 'filter=lfs' 2>/dev/null
+  # Titta på utdata, inte på exitkoden: BSD/macOS xargs kör inte grep alls på tom indata
+  # (inga .gitattributes) och returnerar då 0
+  [ -n "$(git ls-files -z -- .gitattributes '*/.gitattributes' 2>/dev/null | xargs -0 grep -ls 'filter=lfs' -- 2>/dev/null)" ]
 }
 
 if cfg_bool disable; then

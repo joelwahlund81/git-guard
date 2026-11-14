@@ -130,6 +130,7 @@ hooken som `git push` gör. Lägg till ett scenario för varje ny kontroll eller
 | Ocommittad ändring i en pushad fil | Varning |
 | `gg` (torrkörning) med en egen repo-hook | Hooken körs inte (men vid riktig push) |
 | `commit-msg` i `.git/hooks` med git-guard som `core.hooksPath` | Körs via passthrough |
+| Repo utan `.gitattributes`, git-lfs installerat, BSD-xargs (macOS) | `git lfs pre-push` körs inte |
 | Hemlighet tillagd och borttagen i historiken (kräver gitleaks) | Fel |
 | Rent repo, två gånger | Grönt, andra gången från cachen |
 
