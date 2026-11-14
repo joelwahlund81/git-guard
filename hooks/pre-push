@@ -3,17 +3,36 @@
 # (raden ovan används av installationsskriptet för att känna igen hooken)
 #
 # Den här filen behöver aldrig ändras. Allt styrs med git config, globalt
-# (git config --global ...) eller per repo (git config ...). Se README.md.
+# (git config --global ...) eller per repo (git config ...). Se README.md eller
+# skriv 'gghelp inställningar' i terminalen. Stegen 0-8 är numrerade som i README.
 #
 #   gitguard.disable            true = stäng av alla kontroller
 #   gitguard.skipTests          true = kör inga tester
 #   gitguard.skipDotnet         true = hoppa över .NET-kontrollerna
-#   gitguard.skipFormat         true = hoppa över dotnet format
+#   gitguard.skipFormat         true = hoppa över dotnet format (samma som format=off)
+#   gitguard.format             whitespace (standard, snabb) | style (kodstil + analyzers,
+#                               laddar hela solutionen) | off
+#   gitguard.cache              false = kör alltid allt (standard: true – en grön körning
+#                               av gg eller push sparas och .NET/tester körs inte om i onödan)
 #   gitguard.versionDrift       error (standard) | warn
+#   gitguard.existingIssues     warn (standard) | error – problem i .NET-filer som pushen
+#                               inte rör (de fanns redan) varnar i stället för att stoppa
+#   gitguard.sqlLint            error | warn | off – standard: error om repot har .sqlfluff,
+#                               annars warn
 #   gitguard.sqlDialect         tsql (standard) – ignoreras om repot har .sqlfluff
-#   gitguard.protectedBranches  t.ex. "main master" = blockera direkt push dit
+#   gitguard.yamlLint           error | warn | off – tabbar och syntaxfel stoppar alltid (utom off).
+#                               Övriga yamllint/actionlint-anmärkningar: standard error om repot
+#                               har .yamllint (resp. .github/actionlint.yaml), annars warn
+#   gitguard.solution           sökväg till .sln/.slnx när repot har flera
+#   gitguard.testFilter         filter till dotnet test, t.ex. "Category!=Integration"
+#   gitguard.testTimeout        t.ex. "5m" = avbryt tester som hänger (--blame-hang-timeout)
+#   gitguard.protectedBranches  t.ex. "main master release/*" = blockera direkt push dit
+#   gitguard.verbose            true = visa filer, kommandon och full utdata
 #
 # Engångsundantag:  git push --no-verify   |   SKIP_TESTS=1 git push
+#                   GITGUARD_VERBOSE=1 git push   (detaljerad utdata en gång)
+#
+# Terminalprofilen (terminal/) läser dessutom gitguard.startup och gitguard.repoRoots.
 
 set -uo pipefail
 
@@ -26,9 +45,55 @@ red()    { printf '\033[31m✗ %s\033[0m\n' "$*"; }
 green()  { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m! %s\033[0m\n' "$*"; }
 step()   { printf '\033[36m▸ %s\033[0m\n' "$*"; }
+detail() { printf '\033[90m    %s\033[0m\n' "$*"; }
+hint()   { printf '\033[90m    Rätta: %s\033[0m\n' "$*"; }
+
+verbose=0
+vcmd()   { [ "$verbose" -eq 1 ] && printf '\033[90m    $ %s\033[0m\n' "$*"; return 0; }
+
+# Sammanfattning: en rad per steg (ok / warn / fail / skip) som skrivs ut på slutet
+summary=()
+step_t0=$SECONDS
+begin()  { step_t0=$SECONDS; step "$*"; }
+record() {  # record <ok|warn|fail|skip> <steg> [kommentar]
+  summary+=("$1|$2|${3:-}|$((SECONDS - step_t0))")
+  step_t0=$SECONDS
+}
+print_summary() {
+  [ ${#summary[@]} -eq 0 ] && return 0
+  printf '\033[1;36m── Sammanfattning ─────────────────────────\033[0m\n'
+  local line s n why t icon color extra
+  for line in "${summary[@]}"; do
+    IFS='|' read -r s n why t <<< "$line"
+    case "$s" in
+      ok)   icon='✓'; color=32 ;;
+      warn) icon='!'; color=33 ;;
+      fail) icon='✗'; color=31 ;;
+      *)    icon='–'; color=90 ;;
+    esac
+    extra="$why"
+    if [ "$s" != skip ] && [ "${t:-0}" -gt 0 ]; then extra="${extra:+$extra, }${t}s"; fi
+    printf '\033[%sm%s %s\033[0m\033[90m%s\033[0m\n' "$color" "$icon" "$n" "${extra:+  ($extra)}"
+  done
+  printf '\033[90m  Totalt %ss\033[0m\n' "$SECONDS"
+}
+
+# Temporära filer städas även om pushen avbryts med Ctrl+C
+list=""
+cleanup() { [ -n "$list" ] && rm -f "$list"; return 0; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 cfg()      { local v; v="$(git config --get "gitguard.$1" 2>/dev/null)"; printf '%s' "${v:-${2:-}}"; }
 cfg_bool() { [ "$(git config --bool --get "gitguard.$1" 2>/dev/null)" = "true" ]; }
+# cfg_enum <namn> <standard> <tillåtna...> – okända värden varnar och ger standardvärdet
+cfg_enum() {
+  local name="$1" def="$2" v a; shift 2
+  v="$(cfg "$name" "$def")"
+  for a in "$@"; do [ "$v" = "$a" ] && { printf '%s' "$v"; return 0; }; done
+  yellow "Okänt värde gitguard.$name='$v' (tillåtet: $*) – använder $def" >&2
+  printf '%s' "$def"
+}
 # Git Bash på Windows: gör om /c/... till C:\... innan sökvägar skickas till PowerShell
 to_native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 
@@ -45,9 +110,34 @@ run_repo_hooks() {
     [ -x "$h" ] || continue
     [ "$h" -ef "$0" ] && continue
     grep -q '^# git-guard pre-push hook' "$h" 2>/dev/null && continue
+    # Torrkörning (gg): repots hook kan ha sidoeffekter, t.ex. git lfs pre-push som laddar upp filer
+    if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then
+      yellow "Repots egen hook $(basename "$h") körs inte vid torrkörning (gg) – den körs vid git push"
+      record skip "Repots egen hook" "torrkörning"
+      continue
+    fi
     step "Kör repots egen hook: $(basename "$h")"
+    repo_hook_ran=1
     printf '%s\n' "$input" | "$h" "$@" || return 1
   done
+  # Repo med git-lfs men utan egen pre-push-hook (t.ex. när core.hooksPath är global och
+  # git lfs install inte kunde lägga sin hook i .git/hooks): kör git lfs pre-push själv,
+  # annars når LFS-filerna aldrig servern.
+  if [ "${repo_hook_ran:-0}" != 1 ] && uses_lfs; then
+    if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then
+      record skip "git lfs pre-push" "torrkörning"
+    else
+      step "git lfs pre-push (repot använder LFS)"
+      repo_hook_ran=1; repo_hook_label="git lfs pre-push"
+      printf '%s\n' "$input" | git lfs pre-push "$@" || return 1
+    fi
+  fi
+}
+uses_lfs() {
+  command -v git-lfs >/dev/null 2>&1 || return 1
+  # Titta på utdata, inte på exitkoden: BSD/macOS xargs kör inte grep alls på tom indata
+  # (inga .gitattributes) och returnerar då 0
+  [ -n "$(git ls-files -z -- .gitattributes '*/.gitattributes' 2>/dev/null | xargs -0 grep -ls 'filter=lfs' -- 2>/dev/null)" ]
 }
 
 if cfg_bool disable; then
@@ -55,6 +145,7 @@ if cfg_bool disable; then
   run_repo_hooks "$@"; exit $?
 fi
 cfg_bool skipTests && SKIP_TESTS=1
+{ cfg_bool verbose || [ "${GITGUARD_VERBOSE:-0}" = 1 ]; } && verbose=1
 
 printf '\033[1;36m── git-guard ──────────────────────────────\033[0m\n'
 
@@ -64,20 +155,30 @@ if [ -n "$protected" ]; then
   while read -r _ lsha rref _; do
     [ -z "${rref:-}" ] && continue
     [ "$lsha" = "$ZERO" ] && continue
+    case "$rref" in refs/heads/*) ;; *) continue ;; esac
+    branch="${rref#refs/heads/}"
+    set -f   # jokertecken som release/* ska jämföras med branchnamnet, inte med filer
     for b in $protected; do
-      if [ "$rref" = "refs/heads/$b" ]; then
-        red "Direkt push till '$b' är blockerad (gitguard.protectedBranches). Gör en PR."
-        fail=1
-      fi
+      # shellcheck disable=SC2254  # $b får innehålla jokertecken
+      case "$branch" in
+        $b)
+          red "Direkt push till '$branch' är blockerad (gitguard.protectedBranches: $b)"
+          hint "pusha till en egen branch och skapa en PR:  git switch -c <ny-branch> && git push -u $remote HEAD"
+          fail=1; prot_fail=1 ;;
+      esac
     done
+    set +f
   done <<< "$input"
+  if [ "${prot_fail:-0}" = 1 ]; then record fail "Skyddade brancher"; else record ok "Skyddade brancher"; fi
 fi
 
 # --- 1. Vilka filer ingår i pushen? -----------------------------------------
 files=()
+push_shas=""
 while read -r _ lsha _ _; do
   [ -z "${lsha:-}" ] && continue
   [ "$lsha" = "$ZERO" ] && continue                    # branch tas bort
+  push_shas="$push_shas $lsha"
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] && files+=("$f")
   done < <(git log --name-only --pretty=format: --diff-filter=ACMR \
@@ -89,18 +190,58 @@ if [ ${#files[@]} -gt 0 ]; then
   while IFS= read -r f; do uniq_files+=("$f"); done < <(printf '%s\n' "${files[@]}" | sort -u)
   files=("${uniq_files[@]}")
   step "${#files[@]} ändrade fil(er) i pushen"
+  if [ "$verbose" -eq 1 ]; then for f in "${files[@]}"; do detail "$f"; done; fi
 else
   green "Inga ändrade filer att kontrollera"
 fi
 
+# --- Är arbetskatalogen samma sak som det som pushas? -----------------------
+# Konfliktmarkörer, SQL, format, build och tester läser filerna på disk. Skiljer de sig
+# från det som pushas kan kontrollerna ge fel svar åt båda hållen.
+step_t0=$SECONDS
+head_sha="$(git rev-parse HEAD 2>/dev/null)"
+other_commit=0
+while read -r lref lsha _ _; do
+  [ -z "${lsha:-}" ] || [ "$lsha" = "$ZERO" ] && continue
+  case "$lref" in refs/tags/*) continue ;; esac
+  [ "$lsha" != "$head_sha" ] && other_commit=1
+done <<< "$input"
+dirty=""
+if [ ${#files[@]} -gt 0 ]; then
+  dirty="$(git status --porcelain -- "${files[@]}" 2>/dev/null | head -n 5)"
+fi
+if [ $other_commit -eq 1 ]; then
+  yellow "Du pushar en annan commit än den du står på (HEAD) – kontrollerna läser arbetskatalogen och kan ge fel svar"
+  hint "byt till branchen och pusha därifrån:  git switch <branch> && git push"
+  record warn "Arbetskatalog" "pushar inte HEAD"
+elif [ -n "$dirty" ]; then
+  yellow "Ocommittade ändringar i filer som pushas – kontrollerna ser dina lokala ändringar, inte det som pushas:"
+  printf '%s\n' "$dirty" | sed 's/^/    /'
+  hint "committa ändringarna, eller lägg undan dem medan du pushar:  git stash && git push && git stash pop"
+  record warn "Arbetskatalog" "ocommittade ändringar"
+fi
+
 has_file() {  # has_file <glob> – finns någon ändrad fil som matchar?
-  local f; for f in "${files[@]+"${files[@]}"}"; do case "$f" in $1) return 0 ;; esac; done; return 1
+  local f
+  for f in "${files[@]+"${files[@]}"}"; do
+    # shellcheck disable=SC2254  # $1 är medvetet ett mönster, t.ex. '*.csproj'
+    case "$f" in $1) return 0 ;; esac
+  done
+  return 1
 }
 
 # --- 2. Merge-konfliktmarkörer ----------------------------------------------
 if [ ${#files[@]} -gt 0 ]; then
-  if grep -nIE '^(<<<<<<<|>>>>>>>)( |$)' -- "${files[@]}" 2>/dev/null; then
+  step_t0=$SECONDS
+  # xargs delar upp långa fillistor (t.ex. första pushen av ett stort repo)
+  conflicts="$(printf '%s\0' "${files[@]}" | xargs -0 grep -nHIE '^(<<<<<<<|>>>>>>>)( |$)' -- 2>/dev/null)"
+  if [ -n "$conflicts" ]; then
+    printf '%s\n' "$conflicts" | sed 's/^/    /'
     red "Konfliktmarkörer hittade"; fail=1
+    hint "lös konflikten i filerna ovan, ta bort markörerna och gör en ny commit"
+    record fail "Konfliktmarkörer"
+  else
+    record ok "Konfliktmarkörer"
   fi
 fi
 
@@ -109,47 +250,252 @@ sql_files=()
 for f in "${files[@]+"${files[@]}"}"; do
   case "$f" in *.sql|*.SQL) sql_files+=("$f") ;; esac
 done
-if [ ${#sql_files[@]} -gt 0 ]; then
-  step "SQL-lint: ${#sql_files[@]} fil(er)"
+# SSMS sparar ibland som UTF-16. Då kan varken sqlfluff eller sökningen efter
+# konfliktmarkörer läsa filen.
+for f in "${sql_files[@]+"${sql_files[@]}"}"; do
+  case "$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')" in
+    fffe|feff)
+      yellow "$f är sparad som UTF-16 – sqlfluff och sökningen efter konfliktmarkörer kan inte läsa den"
+      hint "spara filen som UTF-8 (SSMS: Arkiv > Spara som > pilen vid Spara > Spara med kodning)"
+      record warn "SQL-kodning" "$f" ;;
+  esac
+done
+# Utan .sqlfluff har teamet inte valt regler: då varnar lint bara (gitguard.sqlLint ändrar det)
+sql_level="$(cfg sqlLint)"
+case "$sql_level" in ""|error|warn|off) ;; *) yellow "Okänt värde gitguard.sqlLint='$sql_level' (tillåtet: error warn off)"; sql_level="" ;; esac
+if [ -z "$sql_level" ]; then if [ -f .sqlfluff ]; then sql_level=error; else sql_level=warn; fi; fi
+if [ ${#sql_files[@]} -gt 0 ] && [ "$sql_level" = off ]; then
+  record skip "SQL" "gitguard.sqlLint off"
+elif [ ${#sql_files[@]} -gt 0 ]; then
+  begin "SQL-lint: ${#sql_files[@]} fil(er)"
   if command -v sqlfluff >/dev/null 2>&1; then
     dialect_arg=()
     [ -f .sqlfluff ] || dialect_arg=(--dialect "$(cfg sqlDialect tsql)")
+    vcmd sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"
     if sqlfluff lint "${dialect_arg[@]+"${dialect_arg[@]}"}" "${sql_files[@]}"; then
-      green "SQL ok"
+      green "SQL ok"; record ok "SQL"
+    elif [ "$sql_level" = error ]; then
+      red "SQL-lint misslyckades"; fail=1
+      hint "sqlfluff fix <fil>   (rättar det mesta automatiskt)"
+      record fail "SQL"
     else
-      red "SQL-lint misslyckades (sqlfluff fix <fil> kan rätta det mesta)"; fail=1
+      yellow "SQL-lint hittade avvikelser (varning – repot har ingen .sqlfluff)"
+      hint "sqlfluff fix <fil>, eller lägg en .sqlfluff i repot så att teamets regler gäller och stoppar"
+      record warn "SQL"
     fi
   else
-    yellow "sqlfluff saknas (pip install sqlfluff) – hoppar över SQL"
+    yellow "sqlfluff saknas – hoppar över SQL"
+    hint "pip install sqlfluff   (eller .\\install-githooks.ps1 -InstallTools)"
+    record skip "SQL" "sqlfluff saknas"
   fi
 fi
 
-# --- 4. Hemligheter ----------------------------------------------------------
-if [ ${#files[@]} -gt 0 ] && command -v gitleaks >/dev/null 2>&1; then
-  step "Söker efter hemligheter"
-  tmp="$(mktemp -d)"
-  for f in "${files[@]}"; do mkdir -p "$tmp/$(dirname "$f")"; cp "$f" "$tmp/$f"; done
-  if gitleaks dir "$tmp" --no-banner >/dev/null 2>&1 \
-     || gitleaks detect --no-git --source "$tmp" --no-banner >/dev/null 2>&1; then
-    green "Inga hemligheter"
-  else
-    red "gitleaks hittade möjliga hemligheter (kör: gitleaks dir . för detaljer)"; fail=1
+# --- 3. YAML (bara ändrade .yml/.yaml) ---------------------------------------
+# Tabbar i indraget och syntaxfel gör att filen inte går att läsa: de stoppar alltid.
+# Övriga anmärkningar (yamllint-regler, actionlint) stoppar bara med gitguard.yamlLint error,
+# eller när repot har en egen konfiguration för verktyget (då har teamet valt reglerna).
+yaml_files=()
+for f in "${files[@]+"${files[@]}"}"; do
+  case "$f" in
+    *.yml|*.yaml|*.YML|*.YAML)
+      # Helm- och andra Go-mallar ({{ ... }} först på en rad) är inte YAML förrän de renderats
+      if grep -qE '^[[:space:]]*\{\{' "$f" 2>/dev/null; then
+        [ "$verbose" -eq 1 ] && detail "hoppar över $f (mall med {{ }}, inte ren YAML)"
+        continue
+      fi
+      yaml_files+=("$f") ;;
+  esac
+done
+yaml_cfg="$(cfg yamlLint)"
+case "$yaml_cfg" in ""|error|warn|off) ;; *) yellow "Okänt värde gitguard.yamlLint='$yaml_cfg' (tillåtet: error warn off)"; yaml_cfg="" ;; esac
+yaml_set() {  # yaml_set <warn|fail|skip> <kommentar> – det allvarligaste vinner
+  case "$1:$yaml_state" in
+    fail:*|warn:ok|warn:skip|skip:ok) yaml_state="$1" ;;
+  esac
+  yaml_why="${yaml_why:+$yaml_why, }$2"
+}
+if [ ${#yaml_files[@]} -gt 0 ] && [ "$yaml_cfg" = off ]; then
+  record skip "YAML" "gitguard.yamlLint off"
+elif [ ${#yaml_files[@]} -gt 0 ]; then
+  begin "YAML: ${#yaml_files[@]} fil(er)"
+  yaml_state=ok; yaml_why=""
+
+  # Tab först på en rad är aldrig giltigt indrag. Tabbar efter mellanslag (t.ex. i ett
+  # skript under run: |) och tab före en kommentar är tillåtna och flaggas inte.
+  tab="$(printf '\t')"
+  tabs_out="$(printf '%s\0' "${yaml_files[@]}" | xargs -0 grep -nHE "^${tab}[[:space:]]*[^[:space:]#]" -- 2>/dev/null \
+              | sed -E 's/^([^:]*:[0-9]+):.*/\1/' | head -n 20)"
+  if [ -n "$tabs_out" ]; then
+    printf '%s\n' "$tabs_out" | sed 's/^/    /'
+    red "Tabbar i indraget – YAML tillåter bara mellanslag"; fail=1
+    hint "byt tabbarna mot mellanslag på raderna ovan (VS Code: Ctrl+Shift+P > Convert Indentation to Spaces)"
+    yaml_set fail "tabbar"
   fi
-  rm -rf "$tmp"
+
+  # yamllint: syntax och regler. Utan egen .yamllint i repot gäller avslappnade regler, och
+  # radslut (CRLF på Windows) och radlängd kontrolleras inte.
+  yl_own=0
+  for c in .yamllint .yamllint.yaml .yamllint.yml; do [ -f "$c" ] && yl_own=1; done
+  yl_level="$yaml_cfg"
+  if [ -z "$yl_level" ]; then if [ $yl_own -eq 1 ]; then yl_level=error; else yl_level=warn; fi; fi
+  if command -v yamllint >/dev/null 2>&1; then
+    yl_args=(-f parsable)
+    [ $yl_own -eq 1 ] || yl_args+=(-d '{extends: relaxed, rules: {new-lines: disable, line-length: disable, trailing-spaces: {level: warning}, new-line-at-end-of-file: {level: warning}}}')
+    vcmd yamllint "${yl_args[@]}" "${yaml_files[@]}"
+    yl_out="$(yamllint "${yl_args[@]}" -- "${yaml_files[@]}" 2>&1 | tr -d '\r')"; yl_rc=$?
+    yl_syntax="$(printf '%s\n' "$yl_out" | grep -E '\[error\] .*\(syntax\)$')"
+    yl_errors="$(printf '%s\n' "$yl_out" | grep -E '\[error\]' | grep -vE '\(syntax\)$')"
+    yl_warns="$(printf '%s\n' "$yl_out" | grep -E '\[warning\]')"
+    if [ $yl_rc -ne 0 ] && [ -z "$yl_syntax$yl_errors$yl_warns" ]; then
+      printf '%s\n' "$yl_out" | tail -n 5 | sed 's/^/    /'
+      yellow "yamllint kunde inte köras (se ovan) – YAML-syntaxen kontrollerades inte"
+      [ $yl_own -eq 1 ] && hint "kontrollera repots .yamllint:  yamllint ."
+      yaml_set warn "yamllint-fel"
+    else
+      [ -n "$yl_out" ] && printf '%s\n' "$yl_out" | sed 's/^/    /'
+      if [ -n "$yl_syntax" ]; then
+        red "Syntaxfel i YAML – filen går inte att läsa"; fail=1
+        hint "raden som pekas ut ovan. Vanligast: fel indrag, ett kolon i ett värde som behöver citattecken, eller - och : utan mellanslag efter"
+        yaml_set fail "syntaxfel"
+      fi
+      if [ -n "$yl_errors" ] && [ "$yl_level" = error ]; then
+        red "yamllint hittade fel (regeln står inom parentes)"; fail=1
+        if [ $yl_own -eq 1 ]; then hint "raderna ovan, eller ändra regeln i repots .yamllint"
+        else hint "raderna ovan, eller låt dem bara varna:  git config gitguard.yamlLint warn"; fi
+        yaml_set fail "yamllint"
+      elif [ -n "$yl_errors$yl_warns" ]; then
+        if [ $yl_own -eq 1 ]; then yellow "yamllint hittade anmärkningar (varning – gitguard.yamlLint warn)"
+        else yellow "yamllint hittade anmärkningar (varning – repot har ingen .yamllint)"; fi
+        hint "raderna ovan. Lägg en .yamllint i repot om teamets regler ska gälla och stoppa"
+        yaml_set warn "yamllint"
+      fi
+    fi
+  else
+    yellow "yamllint saknas – YAML-syntaxen kontrolleras inte (bara tabbar)"
+    hint "pip install yamllint   (eller .\\install-githooks.ps1 -InstallTools)"
+    yaml_set skip "yamllint saknas"
+  fi
+
+  # actionlint: GitHub Actions-workflows (okända nycklar, fel i ${{ }}-uttryck, shellcheck i run:)
+  wf_files=()
+  for f in "${yaml_files[@]}"; do case "$f" in .github/workflows/*) wf_files+=("$f") ;; esac; done
+  if [ ${#wf_files[@]} -gt 0 ]; then
+    al_level="$yaml_cfg"
+    if [ -z "$al_level" ]; then
+      if [ -f .github/actionlint.yaml ] || [ -f .github/actionlint.yml ]; then al_level=error; else al_level=warn; fi
+    fi
+    if command -v actionlint >/dev/null 2>&1; then
+      vcmd actionlint -oneline "${wf_files[@]}"
+      al_out="$(actionlint -no-color -oneline -- "${wf_files[@]}" 2>&1 | tr -d '\r')"; al_rc=$?
+      if [ $al_rc -eq 0 ]; then
+        :
+      elif [ $al_rc -eq 1 ]; then
+        printf '%s\n' "$al_out" | sed 's/^/    /'
+        if [ "$al_level" = error ]; then
+          red "actionlint hittade fel i GitHub Actions-workflows"; fail=1
+          hint "raderna ovan, eller låt dem bara varna:  git config gitguard.yamlLint warn"
+          yaml_set fail "actionlint"
+        else
+          yellow "actionlint hittade anmärkningar i GitHub Actions-workflows (varning)"
+          hint "raderna ovan. Lägg en .github/actionlint.yaml i repot om de ska stoppa"
+          yaml_set warn "actionlint"
+        fi
+      else
+        printf '%s\n' "$al_out" | tail -n 5 | sed 's/^/    /'
+        yellow "actionlint kunde inte köras (se ovan) – workflows kontrollerades bara som YAML"
+        yaml_set warn "actionlint-fel"
+      fi
+    else
+      yellow "actionlint saknas – GitHub Actions-workflows kontrolleras bara som YAML"
+      hint "winget install rhysd.actionlint   (eller .\\install-githooks.ps1 -InstallTools)"
+      yaml_set skip "actionlint saknas"
+    fi
+  fi
+
+  [ "$yaml_state" = ok ] && green "YAML ok"
+  record "$yaml_state" "YAML" "$yaml_why"
+fi
+
+# --- 4. Hemligheter ----------------------------------------------------------
+# Söker i de commits som pushas (git log), inte i arbetskatalogen. Då hittas även en
+# hemlighet som lagts till i en commit och tagits bort i en senare - den följer ändå med.
+# Körs i repots rot så att .gitleaks.toml och .gitleaksignore gäller. --redact maskerar fynden.
+if [ -n "$push_shas" ]; then
+  if command -v gitleaks >/dev/null 2>&1; then
+    begin "Söker efter hemligheter i commits som pushas"
+    # shellcheck disable=SC2086  # push_shas är medvetet en lista
+    log_opts="$(printf '%s ' $push_shas)--not --remotes=$remote"
+    vcmd gitleaks git --redact --log-opts="$log_opts" .
+    if gitleaks git --help >/dev/null 2>&1; then
+      leaks_out="$(gitleaks git --no-banner --redact -v --exit-code 42 --log-opts="$log_opts" . 2>&1)"; rc=$?
+    else
+      leaks_out="$(gitleaks detect --no-banner --redact -v --exit-code 42 --source . --log-opts="$log_opts" 2>&1)"; rc=$?
+    fi
+    if [ $rc -eq 0 ]; then
+      [ "$verbose" -eq 1 ] && printf '%s\n' "$leaks_out" | sed 's/^/    /'
+      green "Inga hemligheter"; record ok "Hemligheter"
+    elif [ $rc -eq 42 ]; then
+      printf '%s\n' "$leaks_out" | sed 's/^/    /'
+      red "gitleaks hittade möjliga hemligheter i commits som ska pushas (maskerade ovan)"; fail=1
+      hint "ta bort hemligheten ur commiten (git commit --amend, eller git rebase -i <commit>^) och byt nyckeln. Falsklarm: lägg fingeravtrycket i .gitleaksignore"
+      record fail "Hemligheter"
+    else
+      printf '%s\n' "$leaks_out" | tail -n 5 | sed 's/^/    /'
+      yellow "gitleaks kunde inte köras (se ovan) – hemligheter kontrollerades inte"
+      record warn "Hemligheter" "gitleaks-fel"
+    fi
+  else
+    yellow "gitleaks saknas – hemligheter kontrolleras inte"
+    hint "winget install Gitleaks.Gitleaks   (eller .\\install-githooks.ps1 -InstallTools)"
+    record skip "Hemligheter" "gitleaks saknas"
+  fi
 fi
 
 # --- 5. Låsfiler (npm) -------------------------------------------------------
 if has_file 'package.json' && [ -f package-lock.json ] && ! has_file 'package-lock.json'; then
-  yellow "package.json ändrad men inte package-lock.json – kör npm install och committa låsfilen om beroenden ändrats"
+  yellow "package.json ändrad men inte package-lock.json"
+  hint "npm install och committa package-lock.json om beroenden ändrats"
+  record warn "npm-låsfil"
 fi
 
-# --- 6. Har kod ändrats? -----------------------------------------------------
+# --- Har kod ändrats? --------------------------------------------------------
+# code_changed:   något annat än dokumentation
+# dotnet_changed: något som kan påverka .NET-bygget (inte SQL, pipelines, skript m.m.)
 code_changed=0
+dotnet_changed=0
 for f in "${files[@]+"${files[@]}"}"; do
-  case "$f" in *.md|*.txt|docs/*|*.png|*.jpg|*.jpeg|*.gif|*.svg) ;; *) code_changed=1 ;; esac
+  case "$f" in *.md|*.txt|docs/*|*.png|*.jpg|*.jpeg|*.gif|*.svg) continue ;; esac
+  code_changed=1
+  case "$f" in
+    *.sql|*.SQL|*.yml|*.yaml|*.ps1|*.psm1|*.psd1|*.sh|*.bash|*.py|*.go|*.tf|*.bicep) ;;
+    Dockerfile|*/Dockerfile|.gitignore|*/.gitignore|.gitattributes|LICENSE*) ;;
+    *) dotnet_changed=1 ;;
+  esac
 done
 
-# --- 7. .NET (PowerShell-kontroller) ----------------------------------------
+# --- Resultatcache -----------------------------------------------------------
+# En grön körning sparas som "<tree> <inställningar>" i .git/git-guard-ok. Pushar du sedan
+# exakt samma innehåll (samma tree, ren arbetskatalog, samma inställningar) körs inte .NET
+# och testerna om. Typiskt: kör gg, sedan git push.
+cache_file="$(git rev-parse --git-dir 2>/dev/null)/git-guard-ok"
+cache_key=""
+cache_hit=0
+if [ "$(git config --bool --get gitguard.cache 2>/dev/null)" != false ]; then
+  # Bara när exakt en commit pushas och arbetskatalogen är ren (kontrollerna läser den)
+  # shellcheck disable=SC2086
+  if [ -n "$push_shas" ] && [ "$(printf '%s\n' $push_shas | sort -u | wc -l | tr -d ' ')" = 1 ] \
+     && [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+    # shellcheck disable=SC2086
+    tree="$(git rev-parse "$(printf '%s' $push_shas)^{tree}" 2>/dev/null)"
+    settings="$( { git config --get-regexp '^gitguard\.' 2>/dev/null; echo "SKIP_TESTS=${SKIP_TESTS:-0}"; } | git hash-object --stdin)"
+    [ -n "$tree" ] && cache_key="$tree $settings"
+  fi
+  if [ -n "$cache_key" ] && [ -f "$cache_file" ] && [ "$(cat "$cache_file" 2>/dev/null)" = "$cache_key" ]; then
+    cache_hit=1
+  fi
+fi
+
+# --- 6. .NET (PowerShell-kontroller) ----------------------------------------
 dotnet_done=0
 is_dotnet=0
 if ls ./*.sln ./*.slnx >/dev/null 2>&1 || [ -n "$(find . -maxdepth 5 \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' \) \
@@ -157,8 +503,24 @@ if ls ./*.sln ./*.slnx >/dev/null 2>&1 || [ -n "$(find . -maxdepth 5 \( -name '*
   is_dotnet=1
 fi
 
-cfg_bool skipDotnet && dotnet_done=1
-if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; then
+if [ $is_dotnet -eq 1 ] && cfg_bool skipDotnet; then
+  dotnet_done=1
+  yellow "Hoppar över .NET-kontrollerna (gitguard.skipDotnet)"
+  record skip ".NET" "gitguard.skipDotnet"
+elif [ $is_dotnet -eq 1 ] && [ $code_changed -eq 0 ]; then
+  record skip ".NET" "bara dokumentation ändrad"
+elif [ $is_dotnet -eq 1 ] && [ $dotnet_changed -eq 0 ]; then
+  dotnet_done=1
+  green "Inga .NET-relevanta filer ändrade (bara SQL, pipelines, skript m.m.) – hoppar över .NET"
+  record skip ".NET" "inga .NET-filer ändrade"
+elif [ $is_dotnet -eq 1 ] && [ $cache_hit -eq 1 ]; then
+  dotnet_done=1
+  green "Samma innehåll är redan kontrollerat och grönt – hoppar över .NET och tester"
+  detail "Kör allt ändå: git config gitguard.cache false   (eller ta bort .git/git-guard-ok)"
+  record skip ".NET" "redan kontrollerat"
+fi
+if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && [ $dotnet_done -eq 0 ] && ! cfg_bool skipDotnet; then
+  step_t0=$SECONDS
   ps_exe=""
   for c in pwsh pwsh.exe powershell.exe powershell; do
     command -v "$c" >/dev/null 2>&1 && { ps_exe="$c"; break; }
@@ -166,56 +528,111 @@ if [ $is_dotnet -eq 1 ] && [ $code_changed -eq 1 ] && ! cfg_bool skipDotnet; the
   check_script="$GG_HOME/checks/dotnet-check.ps1"
 
   if [ -z "$ps_exe" ]; then
-    yellow "PowerShell saknas – kör bara enkla .NET-tester (installera pwsh för fler kontroller)"
+    yellow "PowerShell saknas – kör bara enkla .NET-tester"
+    hint "winget install Microsoft.PowerShell"
+    record warn ".NET" "PowerShell saknas"
   elif [ ! -f "$check_script" ]; then
-    yellow "Hittar inte $check_script – kör installationsskriptet igen"
+    yellow "Hittar inte $check_script"
+    hint ".\\install-githooks.ps1 -Global   (i git-guard-mappen)"
+    record warn ".NET" "dotnet-check.ps1 saknas"
   elif ! command -v dotnet >/dev/null 2>&1; then
     yellow "dotnet saknas i PATH – hoppar över .NET-kontroller"; dotnet_done=1
+    hint "winget install Microsoft.DotNet.SDK.8   (eller en nyare version)"
+    record skip ".NET" "dotnet saknas"
   else
     list="$(mktemp)"
     printf '%s\n' "${files[@]+"${files[@]}"}" > "$list"
     ps_args=(-RepoRoot "$(to_native "$PWD")" -ChangedFilesPath "$(to_native "$list")"
-             -DriftLevel "$(cfg versionDrift error)")
+             -DriftLevel "$(cfg_enum versionDrift error error warn)"
+             -ExistingIssues "$(cfg_enum existingIssues warn warn error)")
     [ "${SKIP_TESTS:-0}" = 1 ] && ps_args+=(-SkipTests)
-    cfg_bool skipFormat && ps_args+=(-SkipFormat)
-    "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-      -File "$(to_native "$check_script")" "${ps_args[@]}" || fail=1
-    rm -f "$list"
+    fmt_mode="$(cfg_enum format whitespace whitespace style off)"
+    if cfg_bool skipFormat || [ "$fmt_mode" = off ]; then ps_args+=(-SkipFormat); else ps_args+=(-FormatMode "$fmt_mode"); fi
+    [ "$verbose" -eq 1 ] && ps_args+=(-Detailed)
+    [ -n "$(cfg solution)" ]    && ps_args+=(-Solution "$(cfg solution)")
+    [ -n "$(cfg testFilter)" ]  && ps_args+=(-TestFilter "$(cfg testFilter)")
+    [ -n "$(cfg testTimeout)" ] && ps_args+=(-TestTimeout "$(cfg testTimeout)")
+    vcmd "$ps_exe" -File "$check_script" "${ps_args[@]}"
+    if "$ps_exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+         -File "$(to_native "$check_script")" "${ps_args[@]}"; then
+      record ok ".NET"
+    else
+      fail=1; record fail ".NET"
+    fi
+    rm -f "$list"; list=""
     dotnet_done=1
   fi
 fi
 
-# --- 8. Tester (övriga språk + .NET-reserv) ---------------------------------
+# --- 7. Tester (övriga språk + .NET-reserv) ---------------------------------
+# run_tests <namn> <verktyg> <kommando...> – kör ett testkommando om verktyget finns
+run_tests() {
+  local name="$1" tool="$2"; shift 2
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    yellow "$tool saknas – hoppar över $name"
+    record skip "$name" "$tool saknas"
+    return 0
+  fi
+  begin "$name"
+  vcmd "$@"
+  if "$@"; then
+    record ok "$name"
+  else
+    red "$name misslyckades"; fail=1
+    hint "kör '$*' och rätta testerna, eller pusha utan tester en gång: SKIP_TESTS=1 git push"
+    record fail "$name"
+  fi
+}
+
 if [ "${SKIP_TESTS:-0}" = 1 ]; then
   yellow "Hoppar över tester (SKIP_TESTS / gitguard.skipTests)"
+  record skip "Tester" "SKIP_TESTS / gitguard.skipTests"
+elif [ $cache_hit -eq 1 ]; then
+  [ $is_dotnet -eq 1 ] || green "Samma innehåll är redan kontrollerat och grönt – hoppar över tester"
+  record skip "Tester" "redan kontrollerat"
 elif [ $code_changed -eq 0 ]; then
   [ ${#files[@]} -gt 0 ] && green "Bara dokumentation ändrad – hoppar över tester"
 else
-  if [ $is_dotnet -eq 1 ] && [ $dotnet_done -eq 0 ] && command -v dotnet >/dev/null 2>&1; then
-    step "dotnet test"
-    dotnet test --nologo -v q || { red "dotnet test misslyckades"; fail=1; }
+  if [ $is_dotnet -eq 1 ] && [ $dotnet_done -eq 0 ]; then
+    dt_args=(test --nologo -v q)
+    [ -n "$(cfg testFilter)" ]  && dt_args+=(--filter "$(cfg testFilter)")
+    [ -n "$(cfg testTimeout)" ] && dt_args+=(--blame-hang-timeout "$(cfg testTimeout)")
+    run_tests "dotnet test" dotnet dotnet "${dt_args[@]}"
   fi
   if [ -f package.json ] && grep -q '"test"[[:space:]]*:' package.json \
      && ! grep -q 'no test specified' package.json; then
-    step "npm test"
-    npm test --silent || { red "npm test misslyckades"; fail=1; }
+    run_tests "npm test" npm npm test --silent
   fi
-  if { [ -f pyproject.toml ] || [ -f pytest.ini ]; } && command -v pytest >/dev/null 2>&1; then
-    step "pytest"
-    pytest -q || { red "pytest misslyckades"; fail=1; }
+  if [ -f pyproject.toml ] || [ -f pytest.ini ]; then
+    run_tests "pytest" pytest pytest -q
   fi
   if [ -f go.mod ]; then
-    step "go test"
-    go test ./... || { red "go test misslyckades"; fail=1; }
+    run_tests "go test" go go test ./...
   fi
 fi
 
-# --- 9. Repots egna hooks ----------------------------------------------------
-run_repo_hooks "$@" || fail=1
+# --- 8. Repots egna hooks ----------------------------------------------------
+step_t0=$SECONDS
+if run_repo_hooks "$@"; then
+  [ "${repo_hook_ran:-0}" = 1 ] && record ok "${repo_hook_label:-Repots egen hook}"
+else
+  fail=1; record fail "${repo_hook_label:-Repots egen hook}"
+fi
+
+# --- Spara grönt resultat för cachen ---------------------------------------------
+if [ -n "$cache_key" ]; then
+  if [ $fail -eq 0 ] && [ $cache_hit -eq 0 ]; then
+    printf '%s' "$cache_key" > "$cache_file" 2>/dev/null || true
+  elif [ $fail -ne 0 ]; then
+    rm -f "$cache_file" 2>/dev/null || true
+  fi
+fi
 
 # -----------------------------------------------------------------------------
+print_summary
 if [ $fail -ne 0 ]; then
   if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then red "Kontrollerna hittade fel (se ovan)"; else red "Push avbruten. Fixa felen ovan eller kör: git push --no-verify"; fi
+  detail "Hjälp: gghelp felsökning  |  $GG_HOME/README.md"
   exit 1
 fi
 if [ "${GITGUARD_DRYRUN:-0}" = 1 ]; then green "Alla kontroller ok (ingen push gjordes)"; else green "Alla kontroller ok – pushar"; fi

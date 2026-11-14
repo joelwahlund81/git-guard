@@ -18,6 +18,12 @@
       4. dotnet format på ändrade filer
       5. dotnet build: referenskonflikter (MSB3277), olösta referenser (MSB3245)
       6. dotnet test
+
+    -Detailed visar varje dotnet-kommando och hela utdatan.
+
+    -ExistingIssues warn: problem i projektfiler som pushen inte rör (de fanns redan) blir
+    varningar i stället för fel. Hooken skickar gitguard.existingIssues (standard warn).
+    Körs skriptet manuellt (ggnet) räknas allt som fel, som tidigare.
 #>
 [CmdletBinding()]
 param(
@@ -27,7 +33,21 @@ param(
     [string]$DriftLevel = 'error',
     [switch]$SkipTests,
     [switch]$SkipFormat,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [ValidateSet('error', 'warn')]
+    [string]$ExistingIssues = 'error',
+    # whitespace: snabb (dotnet format whitespace --folder, laddar inte solutionen)
+    # style: whitespace + kodstil + analyzers enligt .editorconfig (laddar hela solutionen)
+    [ValidateSet('whitespace', 'style')]
+    [string]$FormatMode = 'whitespace',
+    # Solution att bygga när det finns flera (gitguard.solution), relativ till repots rot
+    [string]$Solution,
+    # Skickas till dotnet test --filter, t.ex. "Category!=Integration" (gitguard.testFilter)
+    [string]$TestFilter,
+    # Skickas till dotnet test --blame-hang-timeout, t.ex. "5m" (gitguard.testTimeout)
+    [string]$TestTimeout,
+    # Visa varje dotnet-kommando och hela utdatan (gitguard.verbose / GITGUARD_VERBOSE=1)
+    [switch]$Detailed
 )
 
 # 'Continue': Windows PowerShell 5.1 avbryter annars när dotnet skriver till stderr
@@ -52,10 +72,22 @@ function Write-Warn2([string]$m){ $script:WarnCount++;  Write-Host "$E[33m! $m$E
 function Write-Detail([string]$m) {
     if ($script:RootPrefix) { $m = $m.Replace($script:RootPrefix, '').Replace(($script:RootPrefix -replace '\\', '/'), '') }
     $m = $m -replace '\s*\[[^\[\]]+\.(csproj|fsproj|vbproj|sln|slnx)\]\s*$', ''
+    $m = $m -replace '\s*\[\.\]\s*$', ''   # dotnet format --folder
     Write-Host "$E[90m    $m$E[0m"
 }
 function Write-Issue([string]$Level, [string]$m) {
     if ($Level -eq 'error') { Write-Bad $m } else { Write-Warn2 $m }
+}
+function Write-Skip([string]$m) { Write-Host "$E[90m- $m$E[0m" }
+
+# Med -Detailed: mer utdata från dotnet och inga avkortade fellistor
+$Verb = if ($Detailed) { 'minimal' } else { 'q' }
+$MaxLines = if ($Detailed) { 100000 } else { 15 }
+function Invoke-Dotnet([string[]]$DnArgs) {
+    if ($Detailed) { Write-Host "$E[90m    `$ dotnet $($DnArgs -join ' ')$E[0m" }
+    $o = @(& dotnet @DnArgs 2>&1 | ForEach-Object { "$_" })
+    if ($Detailed) { $o | ForEach-Object { Write-Detail $_ } }
+    return $o
 }
 $started = Get-Date
 
@@ -70,6 +102,7 @@ function Get-NuLabel([string]$Code) {
         'NU1004' { return 'packages.lock.json är i osynk' }
         'NU1101|NU1102|NU1103' { return 'Paket eller version hittades inte' }
         'NU1301' { return 'Kunde inte nå paketkällan' }
+        'NU1510' { return 'Onödig PackageReference (paketet ingår redan i plattformen)' }
         default { return 'NuGet' }
     }
 }
@@ -77,7 +110,34 @@ function Get-NuLabel([string]$Code) {
 # --- Hjälpfunktioner ---------------------------------------------------------
 $ExcludeRx = '[\\/](bin|obj|node_modules|\.git|\.vs|TestResults)[\\/]|[\\/]packages[\\/][^\\/]+\.\d+\.\d+'
 
+# Filer i repot hämtas med git ls-files (spårade + nya, inte ignorerade). Det är mycket snabbare
+# än att gå igenom hela mappträdet med node_modules, bin och obj. Utan git: Get-ChildItem.
+$script:GitFiles = $null
+function Get-GitFileList {
+    if ($null -ne $script:GitFiles) { return $script:GitFiles }
+    $script:GitFiles = @()
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $o = @(& git -c core.quotePath=false ls-files --cached --others --exclude-standard 2>$null)
+        if ($LASTEXITCODE -eq 0) { $script:GitFiles = @($o | Where-Object { $_ } | Select-Object -Unique) }
+        else { $script:GitFiles = $false }
+    } else { $script:GitFiles = $false }
+    return $script:GitFiles
+}
 function Get-RepoFile([string[]]$Include) {
+    $list = Get-GitFileList
+    if ($list -is [array]) {
+        foreach ($rel in $list) {
+            $leaf = Split-Path $rel -Leaf
+            $hit = $false
+            foreach ($pat in $Include) { if ($leaf -like $pat) { $hit = $true; break } }
+            if (-not $hit) { continue }
+            $full = Join-Path (Get-Location).Path $rel
+            if ($full -match $ExcludeRx) { continue }
+            $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+            if ($item -and -not $item.PSIsContainer) { $item }
+        }
+        return
+    }
     Get-ChildItem -Path . -Recurse -File -Include $Include -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch $ExcludeRx }
 }
@@ -137,9 +197,23 @@ if ($solutions.Count -eq 0) {
     $solutions = @(Get-ChildItem -Path . -File -Recurse -Depth 2 -Include '*.sln', '*.slnx' -Force -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch $ExcludeRx })
 }
+$targetIsSolution = $false
+if ($Solution) {
+    $slnPath = Join-Path (Get-Location).Path $Solution
+    if (Test-Path -LiteralPath $slnPath -PathType Leaf) {
+        $solutions = @(Get-Item -LiteralPath $slnPath)
+    } else {
+        Write-Warn2 "gitguard.solution pekar på '$Solution', som inte finns - väljer automatiskt"
+        Write-Detail 'Rätta: git config gitguard.solution <sökväg till .sln/.slnx från repots rot>'
+    }
+}
 if ($solutions.Count -gt 0) {
     $targets = @($solutions[0].FullName)
-    if ($solutions.Count -gt 1) { Write-Detail "Flera solutions hittades, använder $(Get-Rel $solutions[0].FullName)" }
+    $targetIsSolution = $true
+    if ($solutions.Count -gt 1) {
+        Write-Detail "Flera solutions hittades, använder $(Get-Rel $solutions[0].FullName)"
+        Write-Detail "Välj en annan: git config gitguard.solution $(Get-Rel $solutions[1].FullName)"
+    }
 } else {
     $targets = @($projects | ForEach-Object { $_.FullName })
 }
@@ -148,6 +222,38 @@ Write-Step ".NET: $($projects.Count) projekt ($((($targets | ForEach-Object { Sp
 $changed = @()
 if ($ChangedFilesPath -and (Test-Path -LiteralPath $ChangedFilesPath)) {
     $changed = @(Get-Content -LiteralPath $ChangedFilesPath | Where-Object { $_ } | ForEach-Object { $_ -replace '\\', '/' })
+}
+
+# --- Nya eller gamla problem? ------------------------------------------------
+# Ett problem räknas som nytt om pushen ändrar någon av filerna det gäller (projektet,
+# dess packages.config/packages.lock.json) eller en fil som påverkar alla projekt.
+$changedSet = @{}
+foreach ($c in $changed) { $changedSet[$c.ToLower()] = $true }
+$sharedTouched = @($changed | Where-Object {
+    $_ -match '(^|/)(directory\.(build|packages)\.(props|targets)|global\.json|nuget\.config)$' }).Count -gt 0
+$script:OldIssues = 0
+
+function Test-Touched([string[]]$Sources) {
+    if (-not $ChangedFilesPath -or $ExistingIssues -eq 'error' -or $sharedTouched) { return $true }
+    foreach ($src in $Sources) {
+        if (-not $src) { continue }
+        $f = ($src -replace ' \(packages\.config\)$', '').ToLower()
+        $dir = if ($f.Contains('/')) { $f.Substring(0, $f.LastIndexOf('/') + 1) } else { '' }
+        foreach ($cand in @($f, "${dir}packages.lock.json", "${dir}packages.config")) {
+            if ($changedSet.ContainsKey($cand)) { return $true }
+        }
+    }
+    return $false
+}
+
+# Write-RefIssue: som Write-Issue, men ett fel i filer som pushen inte rör blir en varning
+function Write-RefIssue([string]$Level, [string[]]$Sources, [string]$m) {
+    if ($Level -eq 'error' -and -not (Test-Touched $Sources)) {
+        $script:OldIssues++
+        if ($m.EndsWith(':')) { Write-Warn2 ($m.TrimEnd(':') + ' (fanns redan):') } else { Write-Warn2 "$m (fanns redan)" }
+    } else {
+        Write-Issue $Level $m
+    }
 }
 
 # =============================================================================
@@ -182,26 +288,37 @@ foreach ($p in $refFiles) {
     if (-not $x) { continue }
     $rel = Get-Rel $p.FullName
     $local = @{}; Add-Props $x $local
+    # Ett projekt kan välja bort Central Package Management själv
+    $projCpm = $cpmEnabled
+    if ($local['ManagePackageVersionsCentrally'] -eq 'false') { $projCpm = $false }
+    elseif ($local['ManagePackageVersionsCentrally'] -eq 'true') { $projCpm = $true }
 
     foreach ($n in (Get-Nodes $x 'PackageReference')) {
         $id = $n.GetAttribute('Include')
         if (-not $id) { continue }          # Update= räknas inte
         $ver      = Expand-Props (Get-AttrOrChild $n 'Version') $local
         $override = Expand-Props (Get-AttrOrChild $n 'VersionOverride') $local
+        # Villkor (t.ex. per TargetFramework) från ItemGroup och själva referensen
+        $cond = @($n.ParentNode.GetAttribute('Condition'), $n.GetAttribute('Condition')) | Where-Object { $_ }
+        $cond = (($cond -join '&') -replace '\s+', '').ToLower()
 
-        if ($cpmEnabled) {
-            if ($ver) { Write-Bad "$rel`: $id har Version='$ver' men Central Package Management används - flytta versionen till Directory.Packages.props" }
+        if ($projCpm) {
+            if ($ver) {
+                Write-RefIssue 'error' @($rel) "$rel`: $id har Version='$ver' men Central Package Management används"
+                Write-Detail "Rätta: ta bort Version= här och lägg <PackageVersion Include=`"$id`" Version=`"$ver`" /> i Directory.Packages.props"
+            }
             if ($override) {
                 Write-Warn2 "$rel`: $id använder VersionOverride='$override' (avviker från central version)"
                 $ver = $override
             } elseif ($centralVersions.ContainsKey($id.ToLower())) {
                 $ver = $centralVersions[$id.ToLower()]
             } elseif (-not $ver) {
-                Write-Bad "$rel`: $id saknar PackageVersion i Directory.Packages.props"
+                Write-RefIssue 'error' @($rel) "$rel`: $id saknar PackageVersion i Directory.Packages.props"
+                Write-Detail "Rätta: lägg till <PackageVersion Include=`"$id`" Version=`"<version>`" /> i Directory.Packages.props"
             }
         }
         if ($ver -match '\*|^[\[\(]') { Write-Warn2 "$rel`: $id har flytande/intervall-version '$ver' - lås till en exakt version" }
-        $pkgRefs.Add([pscustomobject]@{ Id = $id; Version = $ver; Source = $rel; Kind = 'PackageReference' })
+        $pkgRefs.Add([pscustomobject]@{ Id = $id; Version = $ver; Source = $rel; Kind = 'PackageReference'; Condition = $cond })
     }
 
     foreach ($n in (Get-Nodes $x 'Reference')) {
@@ -215,9 +332,12 @@ foreach ($p in $refFiles) {
         $full = $hint
         if ($hint -notmatch '\$\(') {
             $full = [IO.Path]::GetFullPath((Join-Path (Split-Path $p.FullName -Parent) ($hint -replace '[\\/]', [IO.Path]::DirectorySeparatorChar)))
-            if (-not (Test-Path -LiteralPath $full)) { Write-Bad "$rel`: DLL saknas: $hint" }
+            if (-not (Test-Path -LiteralPath $full)) {
+                Write-RefIssue 'error' @($rel) "$rel`: DLL saknas: $hint"
+                Write-Detail 'Rätta: committa DLL:en, rätta HintPath eller byt till ett NuGet-paket'
+            }
         }
-        $dllRefs.Add([pscustomobject]@{ Name = $name; Version = $ver; HintPath = $hint; FullPath = $full.ToLower(); Source = $rel })
+        $dllRefs.Add([pscustomobject]@{ Name = $name; Version = $ver; HintPath = $hint; FullPath = $full.ToLower(); RealPath = $full; Source = $rel })
         if ($hint -match '(^|[\\/])packages[\\/]') {
             Write-Warn2 "$rel`: $name refereras via packages\-mappen (gammal packages.config-stil) - byt till PackageReference"
         }
@@ -228,20 +348,22 @@ foreach ($p in $refFiles) {
         Write-Warn2 "$rel`: använder packages.config - migrera till PackageReference (Visual Studio: högerklicka packages.config > Migrate)"
         $pcx = Read-Xml $pc
         foreach ($n in (Get-Nodes $pcx 'package')) {
-            $pkgRefs.Add([pscustomobject]@{ Id = $n.GetAttribute('id'); Version = $n.GetAttribute('version'); Source = "$rel (packages.config)"; Kind = 'packages.config' })
+            $pkgRefs.Add([pscustomobject]@{ Id = $n.GetAttribute('id'); Version = $n.GetAttribute('version'); Source = "$rel (packages.config)"; Kind = 'packages.config'; Condition = '' })
         }
     }
 }
 
-# 1a. Samma paket i olika versioner
-$drift = @($pkgRefs | Where-Object { $_.Id -and $_.Version } | Group-Object { $_.Id.ToLower() } |
+# 1a. Samma paket i olika versioner. Referenser med olika villkor (t.ex. en version per
+#     TargetFramework) jämförs inte med varandra - det är avsiktligt.
+$drift = @($pkgRefs | Where-Object { $_.Id -and $_.Version } | Group-Object { "$($_.Id.ToLower())|$($_.Condition)" } |
     Where-Object { @($_.Group | Select-Object -ExpandProperty Version -Unique).Count -gt 1 })
 foreach ($g in $drift) {
     $first = $g.Group[0].Id
-    Write-Issue $DriftLevel "NuGet-paketet $first finns i olika versioner:"
+    Write-RefIssue $DriftLevel @($g.Group | ForEach-Object { $_.Source }) "NuGet-paketet $first finns i olika versioner:"
     foreach ($vg in ($g.Group | Group-Object Version | Sort-Object Name)) {
         Write-Detail ("{0,-14} {1}" -f $vg.Name, (($vg.Group | Select-Object -ExpandProperty Source -Unique) -join ', '))
     }
+    Write-Detail 'Rätta: använd samma Version överallt (eller Central Package Management, se README)'
 }
 
 # 1b. Samma bibliotek som både DLL och NuGet
@@ -252,20 +374,43 @@ foreach ($d in $dllRefs) {
     $file = [IO.Path]::GetFileNameWithoutExtension(($d.HintPath -replace '\\', '/')).ToLower()
     $hit = $null
     if ($pkgIds.ContainsKey($key)) { $hit = $pkgIds[$key] } elseif ($pkgIds.ContainsKey($file)) { $hit = $pkgIds[$file] }
+    # packages.config-stil: DLL:en ligger i paketets egen mapp (packages\Id.1.2.3\lib\...).
+    # Det är NuGet som refererar den, inte en extra DLL.
+    if ($hit -and $d.HintPath -match ('(^|[\\/])packages[\\/]' + [regex]::Escape($hit.Id) + '\.\d')) { $hit = $null }
     if ($hit) {
-        Write-Bad "$($d.Name) refereras både som DLL och som NuGet-paket:"
+        Write-RefIssue 'error' @($d.Source, $hit.Source) "$($d.Name) refereras både som DLL och som NuGet-paket:"
         Write-Detail "DLL:   $($d.Source) -> $($d.HintPath)"
         Write-Detail "NuGet: $($hit.Source) -> $($hit.Id) $($hit.Version)"
+        Write-Detail "Rätta: ta bort <Reference Include=`"$($d.Name)`"> i $($d.Source) och använd NuGet-paketet"
     }
 }
 
-# 1c. Samma DLL med olika versioner eller sökvägar
+# 1c. Samma DLL med olika versioner eller sökvägar.
+#     Fel när versionerna skiljer sig. Bara olika sökväg (t.ex. lib\net45 och lib\netstandard2.0
+#     i samma paket, eller en kopia med samma version) är en varning.
+function Get-DllVersion($Ref) {
+    if ($Ref.Version) { return $Ref.Version }
+    if ($Ref.HintPath -match '\$\(' -or -not (Test-Path -LiteralPath $Ref.RealPath)) { return '' }
+    try { return [Reflection.AssemblyName]::GetAssemblyName($Ref.RealPath).Version.ToString() }
+    catch { return '' }
+}
+function Get-DllLocation($Ref) {
+    # DLL:er i en NuGet-paketmapp räknas till paketmappen, inte till lib\<tfm>
+    if ($Ref.FullPath -match '^(.*[\\/]packages[\\/][^\\/]+)[\\/]') { return $Matches[1] }
+    return $Ref.FullPath
+}
 foreach ($g in ($dllRefs | Group-Object { $_.Name.ToLower() })) {
-    $variants = @($g.Group | ForEach-Object { "$($_.Version)|$($_.FullPath)" } | Select-Object -Unique)
-    if ($variants.Count -gt 1) {
-        Write-Bad "DLL:en $($g.Group[0].Name) refereras med olika versioner/sökvägar:"
-        foreach ($r in $g.Group) { Write-Detail ("{0,-12} {1} ({2})" -f $(if ($r.Version) { $r.Version } else { '?' }), $r.HintPath, $r.Source) }
-    }
+    if ($g.Count -lt 2) { continue }
+    foreach ($r in $g.Group) { $r | Add-Member -NotePropertyName EffVersion -NotePropertyValue (Get-DllVersion $r) -Force }
+    $versions  = @($g.Group | Where-Object { $_.EffVersion } | ForEach-Object { $_.EffVersion } | Select-Object -Unique)
+    $locations = @($g.Group | ForEach-Object { Get-DllLocation $_ } | Select-Object -Unique)
+    if ($versions.Count -gt 1) {
+        Write-RefIssue 'error' @($g.Group | ForEach-Object { $_.Source }) "DLL:en $($g.Group[0].Name) refereras i olika versioner:"
+    } elseif ($locations.Count -gt 1) {
+        Write-Warn2 "DLL:en $($g.Group[0].Name) refereras från olika mappar (samma eller okänd version):"
+    } else { continue }
+    foreach ($r in $g.Group) { Write-Detail ("{0,-12} {1} ({2})" -f $(if ($r.EffVersion) { $r.EffVersion } else { '?' }), $r.HintPath, $r.Source) }
+    Write-Detail 'Rätta: låt alla projekt peka på samma DLL (en gemensam lib-mapp) eller byt till ett NuGet-paket'
 }
 
 if ($pkgRefs.Count -gt 0 -and -not $cpmEnabled -and $projects.Count -ge 3 -and $drift.Count -gt 0) {
@@ -281,10 +426,10 @@ if ($script:ErrorCount -eq 0 -and $script:WarnCount -eq 0) {
 $lockFiles = @(Get-RepoFile @('packages.lock.json'))
 $restoreOk = $true
 foreach ($t in $targets) {
-    $dnArgs = @('restore', $t, '--nologo', '-v', 'q')
+    $dnArgs = @('restore', $t, '--nologo', '-v', $Verb)
     if ($lockFiles.Count -gt 0) { $dnArgs += '--locked-mode' }
     Write-Step ("dotnet restore" + $(if ($lockFiles.Count -gt 0) { ' --locked-mode' } else { '' }))
-    $out = & dotnet @dnArgs 2>&1 | ForEach-Object { "$_" }
+    $out = Invoke-Dotnet $dnArgs
     if ($LASTEXITCODE -ne 0) {
         $restoreOk = $false
         if ($lockFiles.Count -gt 0 -and ($out -match 'NU1004')) {
@@ -296,11 +441,19 @@ foreach ($t in $targets) {
                 foreach ($c in $codes) { Write-Bad "$(Get-NuLabel $c) ($c)" }
             } else {
                 Write-Bad "dotnet restore misslyckades för $(Split-Path $t -Leaf)"
+                Write-Detail "Rätta: kör dotnet restore $(Split-Path $t -Leaf) och läs felet (ggnet -Detailed visar allt)"
+            }
+            if ($codes -contains 'NU1301' -or ($out -match 'Unauthorized|Forbidden')) {
+                Write-Detail 'Paketkällan svarar inte eller nekar åtkomst (VPN, proxy eller utgången inloggning).'
+                Write-Detail 'Rätta: anslut VPN, eller logga in mot Azure Artifacts:  dotnet restore --interactive'
+                Write-Detail '       (kräver Azure Artifacts Credential Provider: https://aka.ms/artifacts-credprovider)'
+            } elseif (@($codes | Where-Object { $_ -match 'NU110[1-3]' }).Count -gt 0) {
+                Write-Detail 'Rätta: kontrollera paketnamn och version, och att rätt paketkällor finns:  dotnet nuget list source'
             }
         }
         $out | Where-Object { $_ -match 'error' } |
             ForEach-Object { ($_ -replace '^.*?error (NU\d{4}: )?', '' -replace 'Warning As Error: ', '').Trim() } |
-            Select-Object -Unique -First 15 | ForEach-Object { Write-Detail $_ }
+            Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_ }
     }
 }
 if ($restoreOk) { Write-Ok 'Restore ok' }
@@ -320,7 +473,7 @@ if ($lockFiles.Count -gt 0) {
 if ($restoreOk) {
     Write-Step 'Analyserar transitiva beroenden'
     $errorCodes = @('NU1605', 'NU1107', 'NU1903', 'NU1904', 'NU1106')
-    $logSeen = @{}
+    $logSeen = [ordered]@{}   # kod|paket|meddelande -> @{ Log; Projects; Sources }
     $resolved = @{}   # "tfm|id" -> @{ version -> [projekt] }
     $issuesBefore = $script:ErrorCount + $script:WarnCount
 
@@ -334,12 +487,11 @@ if ($restoreOk) {
         foreach ($log in @($json.logs)) {
             if (-not $log) { continue }
             $key = "$($log.code)|$($log.libraryId)|$($log.message)"
-            if ($logSeen.ContainsKey($key)) { continue }
-            $logSeen[$key] = $true
-            $level = if ($errorCodes -contains $log.code -or $log.level -eq 'Error') { 'error' } else { 'warn' }
-            $what = Get-NuLabel $log.code
-            Write-Issue $level "$what ($($log.code)) i ${projName}:"
-            Write-Detail ($log.message -replace '\s+', ' ')
+            if (-not $logSeen.Contains($key)) {
+                $logSeen[$key] = @{ Log = $log; Projects = New-Object System.Collections.Generic.List[string]; Sources = New-Object System.Collections.Generic.List[string] }
+            }
+            $logSeen[$key].Projects.Add($projName)
+            $logSeen[$key].Sources.Add((Get-Rel $p.FullName))
         }
 
         foreach ($tfm in @($json.targets.PSObject.Properties)) {
@@ -353,6 +505,18 @@ if ($restoreOk) {
                 $vers[$parts[1]].Add($projName)
             }
         }
+    }
+
+    foreach ($entry in $logSeen.Values) {
+        $log = $entry.Log
+        $level = if ($errorCodes -contains $log.code -or $log.level -eq 'Error') { 'error' } else { 'warn' }
+        $what = Get-NuLabel $log.code
+        Write-RefIssue $level @($entry.Sources) "$what ($($log.code)) i $(($entry.Projects | Select-Object -Unique) -join ', '):"
+        Write-Detail ($log.message -replace '\s+', ' ')
+        if ($log.code -match 'NU190[1-4]') { Write-Detail "Rätta: uppdatera paketet $($log.libraryId) till en version utan sårbarheten (dotnet list package --vulnerable --include-transitive)" }
+        elseif ($log.code -eq 'NU1605') { Write-Detail 'Rätta: höj den direkta PackageReference till den version som beroendet kräver' }
+        elseif ($log.code -eq 'NU1107') { Write-Detail 'Rätta: lägg till en direkt PackageReference med en version som passar alla beroenden' }
+        elseif ($log.code -eq 'NU1510') { Write-Detail "Rätta: ta bort PackageReference till $($log.libraryId) (eller villkora den per TargetFramework om projektet har flera)" }
     }
 
     $transDrift = @($resolved.Values | Where-Object { $_.Versions.Count -gt 1 } | Sort-Object Id)
@@ -372,7 +536,26 @@ if ($restoreOk) {
 # 4. Formatering (bara ändrade filer)
 # =============================================================================
 $codeFiles = @($changed | Where-Object { $_ -match '\.(cs|vb|fs)$' -and (Test-Path -LiteralPath $_) })
-if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
+if ($SkipFormat) {
+    Write-Skip 'Hoppar över formatering (gitguard.skipFormat)'
+} elseif ($codeFiles.Count -eq 0) {
+    if ($ChangedFilesPath) { Write-Skip 'Formatering: inga ändrade .cs/.vb/.fs-filer' }
+} elseif ($FormatMode -eq 'style' -and -not $restoreOk) {
+    Write-Skip 'Hoppar över formatering eftersom restore misslyckades'
+}
+if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $FormatMode -eq 'whitespace') {
+    # Snabb variant: läser bara filerna och .editorconfig, laddar inte solutionen och kräver ingen restore
+    Write-Step "dotnet format whitespace: $($codeFiles.Count) fil(er)"
+    $out = Invoke-Dotnet (@('format', 'whitespace', '.', '--folder', '--verify-no-changes', '-v', $Verb, '--include') + $codeFiles)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Bad 'Formateringen avviker (mellanslag, indrag eller radslut)'
+        $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_.Trim() }
+        Write-Detail ('Rätta: dotnet format whitespace --folder --include ' + ($codeFiles -join ' ') + '   och committa')
+    } else {
+        Write-Ok 'Formatering ok'
+    }
+}
+if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $FormatMode -eq 'style' -and $restoreOk) {
     $hasEditorConfig = (Test-Path -LiteralPath '.editorconfig')
     $mode = if ($hasEditorConfig) { 'style + whitespace (.editorconfig)' } else { 'whitespace' }
     Write-Step "dotnet format: $($codeFiles.Count) fil(er), $mode"
@@ -380,12 +563,12 @@ if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
     foreach ($t in $targets) {
         $dnArgs = @('format', $t)
         if (-not $hasEditorConfig) { $dnArgs += 'whitespace' }
-        $dnArgs += @('--verify-no-changes', '--no-restore', '-v', 'q', '--include') + $codeFiles
-        $out = & dotnet @dnArgs 2>&1 | ForEach-Object { "$_" }
+        $dnArgs += @('--verify-no-changes', '--no-restore', '-v', $Verb, '--include') + $codeFiles
+        $out = Invoke-Dotnet $dnArgs
         if ($LASTEXITCODE -ne 0) {
             $fmtOk = $false
             Write-Bad 'Formateringen avviker'
-            $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First 10 | ForEach-Object { Write-Detail $_.Trim() }
+            $out | Where-Object { $_ -match '(error|warning) ' } | Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_.Trim() }
             Write-Detail ('Rätta: dotnet format' + $(if (-not $hasEditorConfig) { ' whitespace' } else { '' }) + ' och committa')
         }
     }
@@ -397,11 +580,13 @@ if (-not $SkipFormat -and $codeFiles.Count -gt 0 -and $restoreOk) {
 # =============================================================================
 $buildOk = $false
 $allRefIssues = 0
+if ($SkipBuild) { Write-Skip 'Hoppar över build (-SkipBuild)' }
+elseif (-not $restoreOk) { Write-Skip 'Hoppar över build eftersom restore misslyckades' }
 if (-not $SkipBuild -and $restoreOk) {
     Write-Step 'dotnet build'
     $buildOk = $true
     foreach ($t in $targets) {
-        $out = & dotnet build $t --no-restore --nologo -v q '-clp:NoSummary' 2>&1 | ForEach-Object { "$_" }
+        $out = Invoke-Dotnet @('build', $t, '--no-restore', '--nologo', '-v', $Verb, '-clp:NoSummary')
         $code = $LASTEXITCODE
         $refIssues = @($out | Where-Object { $_ -match 'warning (MSB3277|MSB3245|MSB3243|MSB3274|MSB3275)' } |
             ForEach-Object { ($_).Trim() } | Select-Object -Unique)
@@ -413,14 +598,23 @@ if (-not $SkipBuild -and $restoreOk) {
                 'MSB3243' { 'Olöslig referenskonflikt'; break }
                 default   { 'Inkompatibel referens' }
             }
-            Write-Bad $label
+            $src = @()
+            if ($i -match '\[([^\[\]]+\.(csproj|fsproj|vbproj))\]\s*$') { $src = @(Get-Rel $Matches[1]) }
+            Write-RefIssue 'error' $src $label
             Write-Detail ($i -replace '^.*?warning ', '')
+            $fixText = switch -Regex ($i) {
+                'MSB3277|MSB3243' { 'använd samma version av paketet/DLL:en i alla projekt (dotnet build -v d visar vilka referenser som krockar)'; break }
+                'MSB3245'         { 'rätta HintPath, eller lägg till paketet/DLL:en som saknas'; break }
+                default           { 'kontrollera att referensen passar projektets TargetFramework' }
+            }
+            Write-Detail "Rätta: $fixText"
         }
         if ($code -ne 0) {
             $buildOk = $false
             Write-Bad "Bygget misslyckades: $(Split-Path $t -Leaf)"
             $out | Where-Object { $_ -match ': error ' } | ForEach-Object { ($_).Trim() } |
-                Select-Object -Unique -First 15 | ForEach-Object { Write-Detail $_ }
+                Select-Object -Unique -First $MaxLines | ForEach-Object { Write-Detail $_ }
+            Write-Detail "Rätta: rätta felen ovan (dotnet build $(Split-Path $t -Leaf)) och committa"
         }
     }
     if ($buildOk -and $allRefIssues -eq 0) { Write-Ok 'Build ok, inga referenskonflikter' }
@@ -438,17 +632,33 @@ if (-not $SkipTests) {
     } elseif (-not $restoreOk -or (-not $SkipBuild -and -not $buildOk)) {
         Write-Warn2 'Hoppar över tester eftersom restore/build misslyckades'
     } else {
-        Write-Step "dotnet test ($($testProjects.Count) testprojekt)"
-        foreach ($t in $targets) {
-            $dnArgs = @('test', $t, '--nologo', '-v', 'q')
+        # Utan solution körs bara testprojekten, inte alla projekt
+        $testTargets = if ($targetIsSolution) { $targets } else { @($testProjects | ForEach-Object { $_.FullName }) }
+        $extra = ''
+        if ($TestFilter) { $extra += ", filter: $TestFilter" }
+        if ($TestTimeout) { $extra += ", timeout: $TestTimeout" }
+        Write-Step "dotnet test ($($testProjects.Count) testprojekt$extra)"
+        foreach ($t in $testTargets) {
+            $dnArgs = @('test', $t, '--nologo', '-v', $Verb)
             if (-not $SkipBuild) { $dnArgs += '--no-build' } else { $dnArgs += '--no-restore' }
+            if ($TestFilter) { $dnArgs += @('--filter', $TestFilter) }
+            if ($TestTimeout) { $dnArgs += @('--blame-hang-timeout', $TestTimeout) }
+            if ($Detailed) { Write-Host "$E[90m    `$ dotnet $($dnArgs -join ' ')$E[0m" }
             & dotnet @dnArgs 2>&1 | ForEach-Object { Write-Host "    $_" }
-            if ($LASTEXITCODE -ne 0) { Write-Bad 'Tester misslyckades' } else { Write-Ok 'Tester ok' }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Bad "Tester misslyckades$(if (-not $targetIsSolution) { ': ' + (Split-Path $t -Leaf) })"
+                Write-Detail 'Rätta: rätta testerna ovan (dotnet test), eller pusha utan tester en gång: SKIP_TESTS=1 git push'
+                Write-Detail '       Tester som kräver databas/Azure: git config gitguard.testFilter "Category!=Integration"'
+            } else { Write-Ok 'Tester ok' }
         }
     }
 }
 
 # =============================================================================
+if ($script:OldIssues -gt 0) {
+    Write-Detail "$($script:OldIssues) problem markerade (fanns redan) gäller filer som pushen inte ändrar och stoppar inte pushen."
+    Write-Detail 'Vill du att de stoppar: git config gitguard.existingIssues error'
+}
 $secs = [int]((Get-Date) - $started).TotalSeconds
 if ($script:ErrorCount -gt 0) {
     Write-Host "$E[31m.NET: $script:ErrorCount fel, $script:WarnCount varningar (${secs}s)$E[0m"
